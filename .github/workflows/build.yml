@@ -32,16 +32,18 @@ jobs:
       # Auf Forks/PRs von aussen fehlen diese Secrets -> Fallback auf unsignierten Debug-Build,
       # damit der Workflow trotzdem gruen bleibt.
       - name: Decode release keystore
-        id: keystore
-        if: ${{ secrets.IRIS_KEYSTORE_BASE64 != '' }}
         env:
           IRIS_KEYSTORE_BASE64: ${{ secrets.IRIS_KEYSTORE_BASE64 }}
         run: |
-          echo "$IRIS_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/iris-release.jks"
-          echo "has_keystore=true" >> "$GITHUB_OUTPUT"
+          if [ -n "$IRIS_KEYSTORE_BASE64" ]; then
+            echo "$IRIS_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/iris-release.jks"
+            echo "HAS_KEYSTORE=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_KEYSTORE=false" >> "$GITHUB_ENV"
+          fi
 
       - name: Build Release APK (signed)
-        if: steps.keystore.outputs.has_keystore == 'true'
+        if: env.HAS_KEYSTORE == 'true'
         env:
           IRIS_KEYSTORE_PATH: ${{ runner.temp }}/iris-release.jks
           IRIS_KEYSTORE_PASSWORD: ${{ secrets.IRIS_KEYSTORE_PASSWORD }}
@@ -50,7 +52,7 @@ jobs:
         run: ./gradlew assembleRelease --no-daemon
 
       - name: Build Debug APK (no signing secrets available)
-        if: steps.keystore.outputs.has_keystore != 'true'
+        if: env.HAS_KEYSTORE != 'true'
         run: ./gradlew assembleDebug --no-daemon
 
       - name: Rename APK
