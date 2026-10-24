@@ -1,0 +1,31 @@
+// Builds irisd as a native system binary inside an AOSP (or AOSP-derived)
+// source tree. Drop this whole `daemon/` directory at e.g.
+// packages/apps/Iris/daemon/ in your OS tree (or wherever device-local
+// native daemons live in your layout) and add "irisd" to PRODUCT_PACKAGES.
+//
+// `init_rc` makes Soong install init/iris_daemon.rc into /system/etc/init/
+// automatically alongside the binary - no separate product makefile entry
+// needed for that part.
+//
+// Not wired up here (needs your tree's specifics, see OS_INTEGRATION_PLAN.md):
+//   - sepolicy/iris_daemon.te + file_contexts -> your device's sepolicy dirs
+//   - the "iris" AID -> your private/android_filesystem_config.h equivalent
+//   - PRODUCT_PACKAGES += irisd in your device/product makefile
+
+cc_binary {
+    name: "irisd",
+    srcs: ["irisd.c"],
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-DANDROID_BUILD",
+    ],
+    shared_libs: [
+        "libssl",
+        "libcrypto",
+        "liblog",
+    ],
+    init_rc: ["init/iris_daemon.rc"],
+    vendor: false,
+    proprietary: false,
+}

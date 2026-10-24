@@ -55,8 +55,25 @@ Full wire protocol: [`PROTOCOL.md`](PROTOCOL.md).
 
 Early reference implementation. The core loop (register → connect → receive
 → broadcast, with reconnect-with-backoff and a 45s keepalive ping) works end
-to end. Known gaps are listed in `PROTOCOL.md` under "Known limitations" —
-most notably: no cross-instance routing on the server side, and no offline
+to end, in two forms now:
+
+- **App-level** (`app/`, `IrisPushService`) — works standalone on any
+  device, no OS changes needed. This is what you get from a normal
+  sideload/F-Droid-style install.
+- **OS-integrated native daemon** (`daemon/`, `irisd`) — Tier 2 of
+  [`OS_INTEGRATION_PLAN.md`](OS_INTEGRATION_PLAN.md): moves the persistent
+  connection into an `init`-managed native process so it survives
+  Doze/App-Standby the way FCM/GMS does, with `app/`'s
+  `IrisBridgeService` as the thin on-device relay between the daemon and
+  the signature-protected broadcast. End-to-end tested against the live
+  reference server in standalone mode; not yet built into an actual AOSP
+  tree or run under a real `init`/SELinux domain — see `daemon/README.md`
+  for exact status and `IrisDelivery.kt` in `app/` for how a device
+  automatically prefers the daemon over the app-level client when both
+  are present.
+
+Known gaps are listed in `PROTOCOL.md` under "Known limitations" — most
+notably: no cross-instance routing on the server side, and no offline
 queueing. PRs welcome.
 
 ## Using it

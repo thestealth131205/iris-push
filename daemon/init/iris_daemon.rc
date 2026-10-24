@@ -1,0 +1,26 @@
+# Merge this into your OS tree's init.rc includes (or let Soong install it
+# via Android.bp's init_rc property, which copies it to /system/etc/init/
+# automatically - either way it needs to end up somewhere init reads at
+# boot).
+#
+# `class core` starts irisd early and keeps it running across most of the
+# boot lifecycle, same tier as netd/rild. The `socket` line asks init to
+# pre-create and bind a UNIX domain stream socket at /dev/socket/iris_daemon
+# *before* irisd runs, then hand it the already-bound fd via the
+# ANDROID_SOCKET_iris_daemon environment variable - irisd just needs to
+# listen()+accept() on it (see create_bridge_listen_socket() in irisd.c).
+#
+# `user iris` / `group iris inet` requires a dedicated "iris" AID to exist
+# in your build (see OS_INTEGRATION_PLAN.md step 4) - `inet` grants raw
+# socket creation for the outbound TLS/WebSocket connections.
+#
+# seclabel assumes you've authored sepolicy/iris_daemon.te (also in this
+# directory) into your device's sepolicy sources.
+
+service iris_daemon /system/bin/irisd
+    class core
+    user iris
+    group iris inet
+    socket iris_daemon stream 0660 system iris
+    seclabel u:r:iris_daemon:s0
+    writepid /dev/cpuset/system-background/tasks

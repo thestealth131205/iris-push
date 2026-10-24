@@ -72,6 +72,14 @@ class IrisPushService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        if (IrisBridgeService.isDaemonAvailable()) {
+            // A native irisd daemon showed up since this was last started
+            // (e.g. an OS/OTA update added it) - defer to IrisBridgeService
+            // instead of also holding our own socket.
+            IrisDelivery.start(this)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         if (connectLoopJob?.isActive != true) {
             connectLoopJob = scope.launch { connectLoop() }
         }

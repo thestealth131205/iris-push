@@ -16,7 +16,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -109,19 +108,25 @@ class MainActivity : ComponentActivity() {
 
             HorizontalDivider()
 
+            Text(
+                if (IrisBridgeService.isDaemonAvailable())
+                    "Nativer irisd-Systemdienst erkannt – Zustellung läuft über diesen (kein eigener Dauer-Socket in dieser App)."
+                else
+                    "Kein irisd-Systemdienst erkannt – diese App hält die Verbindung selbst (Normalmodus, z.B. Sideload ohne OS-Integration).",
+                style = MaterialTheme.typography.bodySmall
+            )
+
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(
                     onClick = {
-                        ContextCompat.startForegroundService(
-                            context, Intent(context, IrisPushService::class.java)
-                        )
+                        IrisDelivery.start(context)
                         serviceRunning = true
                     },
                     enabled = IrisConfig.isConfigured(context)
                 ) { Text("Dienst starten") }
 
                 OutlinedButton(onClick = {
-                    context.stopService(Intent(context, IrisPushService::class.java))
+                    IrisDelivery.stop(context)
                     serviceRunning = false
                 }) { Text("Dienst stoppen") }
             }
