@@ -1,13 +1,17 @@
 package de.letheapp.iris
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -16,6 +20,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -46,6 +51,21 @@ class MainActivity : ComponentActivity() {
         var token by remember { mutableStateOf(IrisConfig.getToken(context) ?: "") }
         var status by remember { mutableStateOf<String?>(null) }
         var serviceRunning by remember { mutableStateOf(IrisConfig.isConfigured(context)) }
+        var daemonAvailable by remember { mutableStateOf(false) }
+
+        val notificationPermissionLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { /* if denied, the foreground service still runs, just without a visible notification */ }
+
+        LaunchedEffect(Unit) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            daemonAvailable = withContext(Dispatchers.IO) { IrisBridgeService.isDaemonAvailable() }
+        }
 
         Column(
             modifier = Modifier
@@ -109,7 +129,7 @@ class MainActivity : ComponentActivity() {
             HorizontalDivider()
 
             Text(
-                if (IrisBridgeService.isDaemonAvailable())
+                if (daemonAvailable)
                     "Nativer irisd-Systemdienst erkannt – Zustellung läuft über diesen (kein eigener Dauer-Socket in dieser App)."
                 else
                     "Kein irisd-Systemdienst erkannt – diese App hält die Verbindung selbst (Normalmodus, z.B. Sideload ohne OS-Integration).",
@@ -119,8 +139,10 @@ class MainActivity : ComponentActivity() {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(
                     onClick = {
-                        IrisDelivery.start(context)
-                        serviceRunning = true
+                        scope.launch {
+                            withContext(Dispatchers.IO) { IrisDelivery.start(context) }
+                            serviceRunning = true
+                        }
                     },
                     enabled = IrisConfig.isConfigured(context)
                 ) { Text("Dienst starten") }
