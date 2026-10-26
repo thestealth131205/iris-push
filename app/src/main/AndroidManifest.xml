@@ -9,6 +9,12 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- Needed so getPackageInfo() can even see Lethe Messenger under Android 11+ package
+         visibility restrictions, purely to show the "already self-connected" info line. -->
+    <queries>
+        <package android:name="com.Lethe.app" />
+    </queries>
+
     <!--
          Apps that want to receive Iris pushes must hold this signature-level
          permission. That only works if they are signed with the same key as

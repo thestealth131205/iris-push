@@ -49,6 +49,10 @@ private val registerHttpClient = OkHttpClient()
 private val connectedColor = Color(0xFF2E7D32)
 private val disconnectedColor = Color(0xFFC62828)
 
+/** Lethe Messenger registers/connects itself directly (see IrisPushProvider/IrisConnection
+ * in the main app) – it must never be registered through this app's bridge dialog. */
+private const val SELF_CONNECTING_LETHE_PACKAGE = "com.Lethe.app"
+
 class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -155,6 +159,15 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                 }
+                if (isPackageInstalled(context, SELF_CONNECTING_LETHE_PACKAGE)) {
+                    Text(
+                        "Lethe Messenger ist installiert und erscheint absichtlich NICHT in dieser " +
+                            "Liste – er verbindet sich nach dem Login automatisch direkt mit einem " +
+                            "eigenen Token, ganz ohne diese App als Vermittler. Status dazu: Lethe " +
+                            "Messenger → Backend → \"Iris Push\".",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
 
                 HorizontalDivider()
 
@@ -237,6 +250,13 @@ private fun isBatteryExempt(context: Context): Boolean {
     return pm?.isIgnoringBatteryOptimizations(context.packageName) == true
 }
 
+private fun isPackageInstalled(context: Context, packageName: String): Boolean = try {
+    context.packageManager.getPackageInfo(packageName, 0)
+    true
+} catch (_: PackageManager.NameNotFoundException) {
+    false
+}
+
 @Composable
 private fun StatusIcon(ok: Boolean) {
     Icon(
@@ -270,6 +290,7 @@ private fun RegisterAppDialog(onDismiss: () -> Unit, onRegistered: (packageName:
     var packageName by remember { mutableStateOf("") }
     var status by remember { mutableStateOf<String?>(null) }
     var registering by remember { mutableStateOf(false) }
+    val isSelfConnectingApp = packageName.trim().equals(SELF_CONNECTING_LETHE_PACKAGE, ignoreCase = true)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -280,7 +301,11 @@ private fun RegisterAppDialog(onDismiss: () -> Unit, onRegistered: (packageName:
                     "Offener, FCM-unabhängiger Push-Relay-Dienst. Registriert dieses Gerät beim " +
                         "angegebenen Server für die unten genannte App und stellt eingehende Pushes " +
                         "per Broadcast zu (sie benötigt die Permission de.letheapp.iris.RECEIVE_PUSH, " +
-                        "mit demselben Signaturschlüssel wie dieser Build).",
+                        "mit demselben Signaturschlüssel wie dieser Build). Lethe Messenger selbst " +
+                        "gehört NICHT hierher – er verbindet sich beim Login automatisch und direkt " +
+                        "mit einem eigenen Token, ganz ohne diese App. Erscheint er trotzdem nicht in " +
+                        "\"Erkannte Apps\": das ist normal, diese Liste zeigt nur über dieses Menü " +
+                        "registrierte Drittanwendungen.",
                     style = MaterialTheme.typography.bodySmall
                 )
                 OutlinedTextField(
@@ -294,16 +319,26 @@ private fun RegisterAppDialog(onDismiss: () -> Unit, onRegistered: (packageName:
                     value = packageName,
                     onValueChange = { packageName = it },
                     label = { Text("Ziel-App Package-Name") },
-                    placeholder = { Text("de.letheapp.lethe") },
+                    placeholder = { Text("com.example.app") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    isError = isSelfConnectingApp
                 )
+                if (isSelfConnectingApp) {
+                    Text(
+                        "Lethe Messenger verbindet sich bereits selbst mit Iris Push (eigener Token " +
+                            "beim Login) – eine Registrierung hier ist nicht nötig und würde nur einen " +
+                            "zweiten, ungenutzten Token anlegen.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = disconnectedColor
+                    )
+                }
                 status?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
             }
         },
         confirmButton = {
             Button(
-                enabled = serverUrl.isNotBlank() && packageName.isNotBlank() && !registering,
+                enabled = serverUrl.isNotBlank() && packageName.isNotBlank() && !registering && !isSelfConnectingApp,
                 onClick = {
                     registering = true
                     status = "Registriere…"
