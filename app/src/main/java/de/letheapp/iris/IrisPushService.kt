@@ -11,11 +11,14 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
@@ -26,13 +29,16 @@ import okhttp3.WebSocketListener
 import java.util.concurrent.TimeUnit
 
 /**
- * Holds exactly one persistent WebSocket connection to an Iris server and
- * broadcasts any incoming push payload to the locally configured target app
- * via a signature-protected broadcast. See PROTOCOL.md for the wire format.
+ * Holds one persistent WebSocket connection per registered app (see
+ * [IrisConfig.getRegistrations]) and broadcasts incoming push payloads to
+ * the corresponding target app via a signature-protected broadcast. See
+ * PROTOCOL.md for the wire format.
  *
- * Reconnects with a capped linear backoff on disconnect/failure; sends a
- * "ping" text frame every 45s to keep the connection (and any intermediate
- * reverse proxy) alive.
+ * Each connection reconnects independently with a fixed backoff and sends a
+ * "ping" text frame every 45s. [onStartCommand] is safe to call repeatedly
+ * (e.g. after a registration was added/removed) - it reconciles the set of
+ * running connections against the current registration list instead of
+ * assuming it's only ever started once.
  */
 class IrisPushService : Service() {
 
@@ -48,12 +54,22 @@ class IrisPushService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val PING_INTERVAL_MS = 45_000L
         private const val RECONNECT_DELAY_MS = 5_000L
+
+        private val _connectionStatus = MutableStateFlow<Map<String, Boolean>>(emptyMap())
+
+        /** package_name -> currently connected, for every app this service is handling. */
+        val connectionStatus: StateFlow<Map<String, Boolean>> = _connectionStatus.asStateFlow()
+
+        private fun setStatus(packageName: String, connected: Boolean?) {
+            val updated = _connectionStatus.value.toMutableMap()
+            if (connected == null) updated.remove(packageName) else updated[packageName] = connected
+            _connectionStatus.value = updated
+        }
     }
 
-    private val serviceJob = SupervisorJob()
+    private val serviceJob = kotlinx.coroutines.SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + serviceJob)
-    private var socket: WebSocket? = null
-    private var connectLoopJob: Job? = null
+    private val jobs = mutableMapOf<String, Job>() // package_name -> connectLoop job
     private val gson = Gson()
 
     private val client = OkHttpClient.Builder()
@@ -75,54 +91,81 @@ class IrisPushService : Service() {
         if (IrisBridgeService.isDaemonAvailable()) {
             // A native irisd daemon showed up since this was last started
             // (e.g. an OS/OTA update added it) - defer to IrisBridgeService
-            // instead of also holding our own socket.
+            // instead of also holding our own sockets.
             IrisDelivery.start(this)
             stopSelf()
             return START_NOT_STICKY
         }
-        if (connectLoopJob?.isActive != true) {
-            connectLoopJob = scope.launch { connectLoop() }
-        }
+        syncConnections()
         return START_STICKY
     }
 
     override fun onDestroy() {
-        connectLoopJob?.cancel()
-        socket?.close(1000, "service_stopped")
+        for ((pkg, job) in jobs) {
+            job.cancel()
+            setStatus(pkg, null)
+        }
+        jobs.clear()
         serviceJob.cancel()
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private suspend fun connectLoop() {
-        val token = IrisConfig.getToken(this) ?: return
+    /** Starts a connectLoop for every newly-registered app, cancels one for every removed app. */
+    private fun syncConnections() {
+        val registrations = IrisConfig.getRegistrations(this).associateBy { it.packageName }
+
+        for (pkg in jobs.keys.toList()) {
+            if (pkg !in registrations) {
+                jobs.remove(pkg)?.cancel()
+                setStatus(pkg, null)
+            }
+        }
+        for ((pkg, reg) in registrations) {
+            if (pkg !in jobs) {
+                jobs[pkg] = scope.launch { connectLoop(reg) }
+            }
+        }
+        updateNotification(summaryText())
+    }
+
+    private fun summaryText(): String {
+        val total = jobs.size
+        val connected = _connectionStatus.value.values.count { it }
+        return "$connected/$total App(s) verbunden"
+    }
+
+    private suspend fun connectLoop(reg: IrisRegistration) {
         while (scope.isActive) {
             try {
-                connectOnce(token)
+                connectOnce(reg)
             } catch (_: Exception) {
                 // fall through to backoff + retry
             }
-            updateNotification("Getrennt – erneuter Versuch in ${RECONNECT_DELAY_MS / 1000}s…")
+            setStatus(reg.packageName, false)
+            updateNotification(summaryText())
             delay(RECONNECT_DELAY_MS)
         }
     }
 
     /** Suspends until the socket closes or fails, then returns so connectLoop can retry. */
-    private suspend fun connectOnce(token: String) {
-        val url = IrisConfig.websocketUrl(this, token)
+    private suspend fun connectOnce(reg: IrisRegistration) {
+        val url = IrisConfig.websocketUrl(this, reg.token)
         val request = Request.Builder().url(url).build()
-        val closed = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val closed = CompletableDeferred<Unit>()
+        var activeSocket: WebSocket? = null
 
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                updateNotification("Verbunden")
-                scope.launch { pingLoop(webSocket) }
+                setStatus(reg.packageName, true)
+                updateNotification(summaryText())
+                scope.launch { pingLoop(reg.packageName, webSocket) { activeSocket === webSocket } }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (text == "pong") return
-                handleIncoming(text)
+                handleIncoming(reg.packageName, text)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -134,19 +177,20 @@ class IrisPushService : Service() {
             }
         }
 
-        socket = client.newWebSocket(request, listener)
+        activeSocket = client.newWebSocket(request, listener)
         closed.await()
     }
 
-    private suspend fun pingLoop(webSocket: WebSocket) {
-        while (scope.isActive && socket === webSocket) {
+    private suspend fun pingLoop(packageName: String, webSocket: WebSocket, stillActive: () -> Boolean) {
+        while (scope.isActive && stillActive()) {
             delay(PING_INTERVAL_MS)
+            if (!stillActive()) break
             val sent = webSocket.send("ping")
             if (!sent) break
         }
     }
 
-    private fun handleIncoming(text: String) {
+    private fun handleIncoming(targetPackage: String, text: String) {
         val type = object : TypeToken<Map<String, Any?>>() {}.type
         val payload: Map<String, Any?> = try {
             gson.fromJson(text, type)
@@ -154,7 +198,6 @@ class IrisPushService : Service() {
             return
         }
         if (payload["type"] != "push") return
-        val targetPackage = IrisConfig.getTargetPackageName(this) ?: return
 
         val title = payload["title"] as? String ?: ""
         val body = payload["body"] as? String ?: ""
@@ -178,7 +221,7 @@ class IrisPushService : Service() {
         val channel = NotificationChannel(
             CHANNEL_ID, "Iris-Verbindung", NotificationManager.IMPORTANCE_MIN
         ).apply {
-            description = "Haelt die Push-Verbindung zum Iris-Server aufrecht."
+            description = "Haelt die Push-Verbindung(en) zum Iris-Server aufrecht."
             setShowBadge(false)
         }
         getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)

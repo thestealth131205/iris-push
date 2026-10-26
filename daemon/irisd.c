@@ -67,6 +67,7 @@
 #define RECONNECT_DELAY_SEC 5
 #define MAX_BRIDGE_CLIENTS 8
 #define MAX_LINE 8192
+#define IRISD_VERSION "1.1.0"
 
 /* ---------- bridge (daemon -> on-device app) client registry ---------- */
 
@@ -106,6 +107,30 @@ static void bridge_broadcast(const char *line) {
         }
     }
     g_bridge_fd_count = kept;
+    pthread_mutex_unlock(&g_bridge_mutex);
+}
+
+/* Removes one client (e.g. once its reader thread sees EOF) without closing
+ * it a second time - the reader thread already owns the close(). */
+static void bridge_remove_client(int fd) {
+    pthread_mutex_lock(&g_bridge_mutex);
+    int kept = 0;
+    for (int i = 0; i < g_bridge_fd_count; i++) {
+        if (g_bridge_fds[i] != fd) g_bridge_fds[kept++] = g_bridge_fds[i];
+    }
+    g_bridge_fd_count = kept;
+    pthread_mutex_unlock(&g_bridge_mutex);
+}
+
+/* Writes one newline-terminated line to exactly one bridge client (a STATUS
+ * reply), under the same mutex as bridge_broadcast so it can't interleave
+ * with a push line landing on the same fd concurrently. */
+static void bridge_send_to(int fd, const char *line) {
+    char buf[MAX_LINE + 1];
+    int n = snprintf(buf, sizeof(buf), "%s\n", line);
+    if (n <= 0) return;
+    pthread_mutex_lock(&g_bridge_mutex);
+    write(fd, buf, (size_t)n);
     pthread_mutex_unlock(&g_bridge_mutex);
 }
 
@@ -395,6 +420,7 @@ static int ws_read_frame(io_ctx_t *io, unsigned char *payload, size_t payload_ca
 typedef struct {
     token_cfg_t cfg;
     volatile int stop;
+    volatile int connected; /* 1 while the WS handshake has succeeded and no error/close seen yet */
 } conn_arg_t;
 
 static int set_recv_timeout(int fd, int seconds) {
@@ -533,6 +559,7 @@ static void *conn_thread_main(void *arg) {
             continue;
         }
         LOGI("[%s] connected", cfg->package_name);
+        a->connected = 1;
 
         time_t last_ping = time(NULL);
         unsigned char payload[MAX_LINE];
@@ -581,6 +608,7 @@ static void *conn_thread_main(void *arg) {
             }
         }
 
+        a->connected = 0;
         if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
         close(fd);
         if (!a->stop) sleep(RECONNECT_DELAY_SEC);
@@ -683,6 +711,33 @@ static void rescan_dir(const char *dir) {
     pthread_mutex_unlock(&g_tracked_mutex);
 }
 
+/* Builds the JSON line sent back in response to a "STATUS" request on the
+ * bridge control socket: daemon version plus one {package_name,connected}
+ * entry per currently tracked (i.e. config file present) app. */
+static void build_status_json(char *out, size_t out_sz) {
+    char apps_buf[4096];
+    size_t apps_len = 0;
+    apps_buf[0] = '\0';
+
+    pthread_mutex_lock(&g_tracked_mutex);
+    int first = 1;
+    for (tracked_t *t = g_tracked; t; t = t->next) {
+        char entry[384];
+        int n = snprintf(entry, sizeof(entry), "%s{\"package_name\":\"%s\",\"connected\":%s}",
+            first ? "" : ",", t->arg->cfg.package_name, t->arg->connected ? "true" : "false");
+        if (n > 0 && apps_len + (size_t)n + 1 < sizeof(apps_buf)) {
+            memcpy(apps_buf + apps_len, entry, (size_t)n);
+            apps_len += (size_t)n;
+            apps_buf[apps_len] = '\0';
+            first = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_tracked_mutex);
+
+    snprintf(out, out_sz, "{\"type\":\"status\",\"daemon_version\":\"%s\",\"apps\":[%s]}",
+        IRISD_VERSION, apps_buf);
+}
+
 static void *watch_thread_main(void *arg) {
     const char *dir = (const char *)arg;
     rescan_dir(dir);
@@ -708,6 +763,45 @@ static void *watch_thread_main(void *arg) {
          * handful of apps per device, not thousands). */
         rescan_dir(dir);
     }
+    return NULL;
+}
+
+/* ---------- bridge client reader thread (IrisBridgeService -> daemon commands) ----------
+ * Each accepted bridge client also gets a reader thread so it can issue
+ * "STATUS\n" and get back one JSON line describing daemon_version plus
+ * per-app connected state - this is how the app UI tells a genuinely
+ * running irisd (and its live per-app state) apart from a stale/foreign
+ * process that merely happens to be listening on the same socket name. */
+
+typedef struct {
+    int fd;
+} bridge_reader_arg_t;
+
+static void *bridge_client_reader_main(void *arg) {
+    int fd = ((bridge_reader_arg_t *)arg)->fd;
+    free(arg);
+
+    char line[256];
+    size_t len = 0;
+    for (;;) {
+        char c;
+        ssize_t r = read(fd, &c, 1);
+        if (r <= 0) break;
+        if (c == '\n') {
+            line[len] = '\0';
+            if (strcmp(line, "STATUS") == 0) {
+                char status[4096];
+                build_status_json(status, sizeof(status));
+                bridge_send_to(fd, status);
+            }
+            len = 0;
+        } else if (len + 1 < sizeof(line)) {
+            line[len++] = c;
+        }
+    }
+
+    bridge_remove_client(fd);
+    LOGI("bridge client disconnected (fd=%d)", fd);
     return NULL;
 }
 
@@ -779,6 +873,16 @@ int main(int argc, char **argv) {
         }
         bridge_add_client(client_fd);
         LOGI("bridge client connected (fd=%d)", client_fd);
+
+        bridge_reader_arg_t *ra = malloc(sizeof(bridge_reader_arg_t));
+        ra->fd = client_fd;
+        pthread_t reader_tid;
+        if (pthread_create(&reader_tid, NULL, bridge_client_reader_main, ra) == 0) {
+            pthread_detach(reader_tid);
+        } else {
+            LOGE("pthread_create failed for bridge reader (fd=%d)", client_fd);
+            free(ra);
+        }
     }
 
     return 0;

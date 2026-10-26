@@ -32,6 +32,43 @@ hardened daemon - see "Known simplifications" below before relying on it.
   turns it into the same `de.letheapp.iris.PUSH` signature-protected
   broadcast `IrisPushService` sends when it's the one holding the
   connection directly.
+- Answers a `STATUS\n` request line on the same control socket with one
+  JSON line reporting `daemon_version` and the live `connected` state of
+  every registered app (see below) - this is what the app UI uses to tell
+  a genuinely running `irisd` apart from a stale/foreign process on the
+  same socket name, and to show per-app connection status without having
+  to hold its own duplicate connection.
+
+## Bridge control-socket protocol
+
+Any client connected to `iris_daemon` receives, unprompted, one JSON line
+per incoming push:
+
+```json
+{"package_name": "de.letheapp.lethe", "title": "...", "body": "...", "data_json": "{...}"}
+```
+
+It may additionally send a request line at any time (the socket is
+bidirectional, request/response interleaves freely with the unprompted push
+lines above):
+
+```
+STATUS
+```
+
+Reply (one line):
+
+```json
+{"type": "status", "daemon_version": "1.1.0", "apps": [
+  {"package_name": "de.letheapp.lethe", "connected": true},
+  {"package_name": "de.letheapp.other", "connected": false}
+]}
+```
+
+`apps` lists every app with a config file currently present in the watched
+directory (regardless of whether its WebSocket is up right now);
+`connected` reflects the live state of that app's connection, not whether
+it's merely configured.
 
 ## Building
 
