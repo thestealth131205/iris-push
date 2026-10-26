@@ -160,7 +160,7 @@ class IrisPushService : Service() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 setStatus(reg.packageName, true)
                 updateNotification(summaryText())
-                scope.launch { pingLoop(reg.packageName, webSocket) { activeSocket === webSocket } }
+                scope.launch { pingLoop(webSocket) { activeSocket === webSocket } }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -181,7 +181,7 @@ class IrisPushService : Service() {
         closed.await()
     }
 
-    private suspend fun pingLoop(packageName: String, webSocket: WebSocket, stillActive: () -> Boolean) {
+    private suspend fun pingLoop(webSocket: WebSocket, stillActive: () -> Boolean) {
         while (scope.isActive && stillActive()) {
             delay(PING_INTERVAL_MS)
             if (!stillActive()) break
