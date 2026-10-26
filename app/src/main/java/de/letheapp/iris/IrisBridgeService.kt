@@ -66,6 +66,7 @@ class IrisBridgeService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        IrisLog.log(this, "IrisBridgeService", "onCreate")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -77,6 +78,7 @@ class IrisBridgeService : Service() {
     }
 
     override fun onDestroy() {
+        IrisLog.log(this, "IrisBridgeService", "onDestroy")
         connectLoopJob?.cancel()
         serviceJob.cancel()
         super.onDestroy()
@@ -88,8 +90,8 @@ class IrisBridgeService : Service() {
         while (scope.isActive) {
             try {
                 readFromDaemon()
-            } catch (_: Exception) {
-                // daemon not running yet / restarted - fall through to retry
+            } catch (e: Exception) {
+                IrisLog.log(this, "IrisBridgeService", "Verbindung zum Systemdienst verloren: ${e.javaClass.simpleName}: ${e.message}")
             }
             updateNotification("Getrennt vom Systemdienst – erneuter Versuch in ${RECONNECT_DELAY_MS / 1000}s…")
             delay(RECONNECT_DELAY_MS)

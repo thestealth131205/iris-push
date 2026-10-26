@@ -13,10 +13,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
@@ -27,6 +29,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
@@ -65,6 +70,8 @@ class MainActivity : ComponentActivity() {
         var batteryExempt by remember { mutableStateOf(isBatteryExempt(context)) }
         var showMenu by remember { mutableStateOf(false) }
         var showRegisterDialog by remember { mutableStateOf(false) }
+        var showLogDialog by remember { mutableStateOf(false) }
+        var showInfoDialog by remember { mutableStateOf(false) }
 
         val notificationPermissionLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.RequestPermission()
@@ -100,6 +107,20 @@ class MainActivity : ComponentActivity() {
                                 onClick = {
                                     showMenu = false
                                     showRegisterDialog = true
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Log") },
+                                onClick = {
+                                    showMenu = false
+                                    showLogDialog = true
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Info") },
+                                onClick = {
+                                    showMenu = false
+                                    showInfoDialog = true
                                 }
                             )
                         }
@@ -189,6 +210,14 @@ class MainActivity : ComponentActivity() {
                     showRegisterDialog = false
                 }
             )
+        }
+
+        if (showLogDialog) {
+            LogDialog(onDismiss = { showLogDialog = false })
+        }
+
+        if (showInfoDialog) {
+            InfoDialog(onDismiss = { showInfoDialog = false })
         }
     }
 
@@ -295,6 +324,106 @@ private fun RegisterAppDialog(onDismiss: () -> Unit, onRegistered: (packageName:
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Abbrechen") }
+        }
+    )
+}
+
+@Composable
+private fun LogDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    var logText by remember { mutableStateOf(IrisLog.readAll(context)) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Log") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Ereignis- und Absturz-Log dieses Geräts. Hilft bei der Fehlersuche, " +
+                        "falls der Dienst ab und zu ohne ersichtlichen Grund abstürzt – bitte bei " +
+                        "Problemen über \"Teilen\" mitschicken.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                SelectionContainer {
+                    Text(
+                        logText,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier
+                            .heightIn(max = 360.dp)
+                            .verticalScroll(rememberScrollState())
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { shareLog(context, logText) }) { Text("Teilen") }
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = {
+                    IrisLog.clear(context)
+                    logText = IrisLog.readAll(context)
+                }) { Text("Leeren") }
+                TextButton(onClick = onDismiss) { Text("Schließen") }
+            }
+        }
+    )
+}
+
+private fun shareLog(context: Context, logText: String) {
+    val capped = if (logText.length > 200_000) logText.takeLast(200_000) else logText
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, "Iris Push Log")
+        putExtra(Intent.EXTRA_TEXT, capped)
+    }
+    context.startActivity(Intent.createChooser(intent, "Log teilen").apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    })
+}
+
+@Composable
+private fun InfoDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Info") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Iris Push v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    "Offener, FCM-unabhängiger Push-Relay-Dienst für Apps und Geräte ohne " +
+                        "Google Play Services. MIT-lizenziert.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                HorizontalDivider()
+                LinkRow("Lethe-Website", "https://letheapp.de", context)
+                LinkRow("Iris Push herunterladen", "https://letheapp.de/iris.html", context)
+                LinkRow("GitHub-Repository", "https://github.com/thestealth131205/iris-push", context)
+                LinkRow("Protokoll-Dokumentation", "https://github.com/thestealth131205/iris-push/blob/main/PROTOCOL.md", context)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Schließen") }
+        }
+    )
+}
+
+@Composable
+private fun LinkRow(label: String, url: String, context: Context) {
+    Text(
+        label,
+        style = MaterialTheme.typography.bodyMedium,
+        textDecoration = TextDecoration.Underline,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.clickable {
+            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
         }
     )
 }

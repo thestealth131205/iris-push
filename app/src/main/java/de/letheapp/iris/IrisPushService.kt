@@ -80,11 +80,13 @@ class IrisPushService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        IrisLog.log(this, "IrisPushService", "onCreate")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification("Verbinde…"))
         if (!IrisConfig.isConfigured(this)) {
+            IrisLog.log(this, "IrisPushService", "onStartCommand: keine Registrierung, stoppe")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -92,6 +94,7 @@ class IrisPushService : Service() {
             // A native irisd daemon showed up since this was last started
             // (e.g. an OS/OTA update added it) - defer to IrisBridgeService
             // instead of also holding our own sockets.
+            IrisLog.log(this, "IrisPushService", "onStartCommand: irisd erkannt, wechsle zu IrisBridgeService")
             IrisDelivery.start(this)
             stopSelf()
             return START_NOT_STICKY
@@ -101,6 +104,7 @@ class IrisPushService : Service() {
     }
 
     override fun onDestroy() {
+        IrisLog.log(this, "IrisPushService", "onDestroy (${jobs.size} aktive Verbindung(en))")
         for ((pkg, job) in jobs) {
             job.cancel()
             setStatus(pkg, null)
@@ -140,8 +144,8 @@ class IrisPushService : Service() {
         while (scope.isActive) {
             try {
                 connectOnce(reg)
-            } catch (_: Exception) {
-                // fall through to backoff + retry
+            } catch (e: Exception) {
+                IrisLog.log(this, "IrisPushService", "Verbindung zu ${reg.packageName} fehlgeschlagen: ${e.javaClass.simpleName}: ${e.message}")
             }
             setStatus(reg.packageName, false)
             updateNotification(summaryText())
@@ -170,10 +174,12 @@ class IrisPushService : Service() {
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                IrisLog.log(this@IrisPushService, "IrisPushService", "${reg.packageName}: Verbindung geschlossen ($code $reason)")
                 closed.complete(Unit)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                IrisLog.log(this@IrisPushService, "IrisPushService", "${reg.packageName}: Verbindung fehlgeschlagen: ${t.javaClass.simpleName}: ${t.message}")
                 closed.complete(Unit)
             }
         }
