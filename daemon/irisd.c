@@ -253,6 +253,7 @@ typedef struct {
     int use_tls;
     char path[512]; /* /iris/connect/<token> */
     char package_name[256];
+    char token[256];
 } token_cfg_t;
 
 static int parse_server_url(const char *url, char *host, size_t host_sz, int *port, int *use_tls) {
@@ -311,6 +312,7 @@ static int load_token_cfg(const char *dir, const char *filename, token_cfg_t *cf
         return -1;
     }
     snprintf(cfg->path, sizeof(cfg->path), "/iris/connect/%s", token);
+    strncpy(cfg->token, token, sizeof(cfg->token) - 1);
     return 0;
 }
 
@@ -514,6 +516,64 @@ static int ws_handshake(io_ctx_t *io, const char *host, const char *path) {
     return 0;
 }
 
+/* One-shot, best-effort POST /push/installed on a throwaway connection - lets the
+ * server know this specific token is served by the native daemon (component=daemon)
+ * rather than only by the app's own Java client, independent of whether the
+ * long-lived /iris/connect WS happens to be up at any given instant. Failures are
+ * logged and ignored; this is a status signal, not required for push delivery. */
+static void report_installed(const token_cfg_t *cfg) {
+    int fd = tcp_connect(cfg->host, cfg->port);
+    if (fd < 0) {
+        LOGW("[%s] /push/installed report: tcp connect failed", cfg->package_name);
+        return;
+    }
+    set_recv_timeout(fd, RECV_TIMEOUT_SEC);
+
+    io_ctx_t io = { .fd = fd, .ssl = NULL };
+    SSL_CTX *ssl_ctx = NULL;
+    SSL *ssl = NULL;
+    if (cfg->use_tls) {
+        ssl_ctx = SSL_CTX_new(TLS_client_method());
+        SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
+        SSL_CTX_set_default_verify_paths(ssl_ctx);
+        ssl = SSL_new(ssl_ctx);
+        SSL_set_fd(ssl, fd);
+        SSL_set_tlsext_host_name(ssl, cfg->host);
+        if (SSL_connect(ssl) != 1) {
+            LOGW("[%s] /push/installed report: TLS handshake failed", cfg->package_name);
+            SSL_free(ssl);
+            SSL_CTX_free(ssl_ctx);
+            close(fd);
+            return;
+        }
+        io.ssl = ssl;
+    }
+
+    char body[384];
+    int body_len = snprintf(body, sizeof(body),
+        "{\"token\":\"%s\",\"component\":\"daemon\"}", cfg->token);
+    char req[768];
+    int req_len = snprintf(req, sizeof(req),
+        "POST /push/installed HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n%s", cfg->host, body_len, body);
+
+    if (io_write(&io, req, (size_t)req_len) != req_len) {
+        LOGW("[%s] /push/installed report: write failed", cfg->package_name);
+    } else {
+        char resp[256];
+        io_read(&io, resp, sizeof(resp) - 1); /* best-effort drain, ignore content */
+        LOGI("[%s] /push/installed reported", cfg->package_name);
+    }
+
+    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+    if (ssl_ctx) SSL_CTX_free(ssl_ctx);
+    close(fd);
+}
+
 static void *conn_thread_main(void *arg) {
     conn_arg_t *a = (conn_arg_t *)arg;
     token_cfg_t *cfg = &a->cfg;
@@ -560,6 +620,7 @@ static void *conn_thread_main(void *arg) {
         }
         LOGI("[%s] connected", cfg->package_name);
         a->connected = 1;
+        report_installed(cfg);
 
         time_t last_ping = time(NULL);
         unsigned char payload[MAX_LINE];

@@ -161,6 +161,7 @@ class IrisPushService : Service() {
                 setStatus(reg.packageName, true)
                 updateNotification(summaryText())
                 scope.launch { pingLoop(webSocket) { activeSocket === webSocket } }
+                scope.launch { IrisApi.reportInstalled(IrisConfig.getServerUrl(this@IrisPushService), reg.token) }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
