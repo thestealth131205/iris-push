@@ -50,6 +50,15 @@ class IrisPushService : Service() {
         private const val PING_INTERVAL_MS = 45_000L
         private const val RECONNECT_DELAY_MS = 5_000L
         private const val CLOSE_TOKEN_REJECTED = 4001
+        // Server: another connection with the same token took over (e.g. the app's own
+        // fallback connection while it hands over to Iris). Wait longer before retrying
+        // so the two don't keep kicking each other off every few seconds.
+        private const val CLOSE_REPLACED = 4002
+        private const val REPLACED_RETRY_DELAY_MS = 30_000L
+        // Android drops notification updates that come faster than ~5/s per app. Coalesce
+        // them, otherwise the last state (e.g. "1/1 verbunden" right after "Verbinde…")
+        // can get lost and the notification is stuck on an old text.
+        private const val NOTIFICATION_DEBOUNCE_MS = 1_000L
 
         private val _connectionStatus = MutableStateFlow<Map<String, Boolean>>(emptyMap())
 
@@ -82,6 +91,11 @@ class IrisPushService : Service() {
     private val serviceJob = kotlinx.coroutines.SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + serviceJob)
     private val jobs = mutableMapOf<String, Job>() // package_name -> connectLoop job
+    private val jobTokens = mutableMapOf<String, String>() // package_name -> token its job uses
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val postNotification = Runnable {
+        getSystemService(NotificationManager::class.java)?.notify(NOTIFICATION_ID, buildNotification(summaryText()))
+    }
     private val gson = Gson()
 
     private val client = OkHttpClient.Builder()
@@ -99,7 +113,7 @@ class IrisPushService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         try {
             ServiceCompat.startForeground(
-                this, NOTIFICATION_ID, buildNotification("Verbinde…"),
+                this, NOTIFICATION_ID, buildNotification(if (jobs.isEmpty()) "Verbinde…" else summaryText()),
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
             )
         } catch (e: Exception) {
@@ -136,7 +150,13 @@ class IrisPushService : Service() {
             setStatus(pkg, null)
         }
         jobs.clear()
+        jobTokens.clear()
+        mainHandler.removeCallbacks(postNotification)
         serviceJob.cancel()
+        // Sockets aren't tied to the coroutines - close them explicitly, otherwise a
+        // restarted service connects a second time with the same token and the two
+        // connections keep replacing each other at the server.
+        client.dispatcher.cancelAll()
         super.onDestroy()
     }
 
@@ -160,14 +180,18 @@ class IrisPushService : Service() {
         val registrations = IrisConfig.getRegistrations(this).associateBy { it.packageName }
 
         for (pkg in jobs.keys.toList()) {
-            if (pkg !in registrations) {
+            // Also restart when the app re-registered with a new token - the old loop would
+            // otherwise keep reconnecting with the revoked token.
+            if (registrations[pkg]?.token != jobTokens[pkg]) {
                 jobs.remove(pkg)?.cancel()
+                jobTokens.remove(pkg)
                 setStatus(pkg, null)
             }
         }
         for ((pkg, reg) in registrations) {
             if (pkg !in jobs) {
                 jobs[pkg] = scope.launch { connectLoop(reg) }
+                jobTokens[pkg] = reg.token
             }
         }
         updateNotification(summaryText())
@@ -181,22 +205,23 @@ class IrisPushService : Service() {
 
     private suspend fun connectLoop(reg: IrisRegistration) {
         while (scope.isActive) {
+            var closeCode = 0
             try {
-                connectOnce(reg)
+                closeCode = connectOnce(reg)
             } catch (e: Exception) {
                 IrisLog.log(this, "IrisPushService", "Verbindung zu ${reg.packageName} fehlgeschlagen: ${e.javaClass.simpleName}: ${e.message}")
             }
             setStatus(reg.packageName, false)
             updateNotification(summaryText())
-            delay(RECONNECT_DELAY_MS)
+            delay(if (closeCode == CLOSE_REPLACED) REPLACED_RETRY_DELAY_MS else RECONNECT_DELAY_MS)
         }
     }
 
-    /** Suspends until the socket closes or fails, then returns so connectLoop can retry. */
-    private suspend fun connectOnce(reg: IrisRegistration) {
+    /** Suspends until the socket closes or fails, then returns the close code (0 on failure) so connectLoop can retry. */
+    private suspend fun connectOnce(reg: IrisRegistration): Int {
         val url = IrisConfig.websocketUrl(this, reg.token)
         val request = Request.Builder().url(url).build()
-        val closed = CompletableDeferred<Unit>()
+        val closed = CompletableDeferred<Int>()
         var activeSocket: WebSocket? = null
 
         val listener = object : WebSocketListener() {
@@ -219,19 +244,24 @@ class IrisPushService : Service() {
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 IrisLog.log(this@IrisPushService, "IrisPushService", "${reg.packageName}: Verbindung geschlossen ($code $reason)")
                 if (code == CLOSE_TOKEN_REJECTED) onTokenRejected(reg)
-                closed.complete(Unit)
+                closed.complete(code)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 IrisLog.log(this@IrisPushService, "IrisPushService", "${reg.packageName}: Verbindung fehlgeschlagen: ${t.javaClass.simpleName}: ${t.message}")
                 // Older servers reject unknown tokens before the handshake (HTTP 403).
                 if (response?.code == 403) onTokenRejected(reg)
-                closed.complete(Unit)
+                closed.complete(0)
             }
         }
 
         activeSocket = client.newWebSocket(request, listener)
-        closed.await()
+        try {
+            return closed.await()
+        } finally {
+            // Cancelled (registration removed/token changed): don't leave the socket open.
+            activeSocket?.cancel()
+        }
     }
 
     private suspend fun pingLoop(webSocket: WebSocket, stillActive: () -> Boolean) {
@@ -302,8 +332,10 @@ class IrisPushService : Service() {
             .build()
     }
 
+    /** Debounced, always shows the current [summaryText] - see NOTIFICATION_DEBOUNCE_MS. */
+    @Suppress("UNUSED_PARAMETER")
     private fun updateNotification(status: String) {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm?.notify(NOTIFICATION_ID, buildNotification(status))
+        mainHandler.removeCallbacks(postNotification)
+        mainHandler.postDelayed(postNotification, NOTIFICATION_DEBOUNCE_MS)
     }
 }
