@@ -44,7 +44,7 @@ object IrisDaemonSync {
         }
     }
 
-    private fun syncRegistrations(context: Context, status: DaemonStatus) {
+    private fun syncRegistrations(context: Context, status: DaemonInfo) {
         if (status.protocolVersion < 2) return
         for (reg in IrisConfig.getRegistrations(context)) send(context, reg.packageName, reg.token)
     }
@@ -57,7 +57,7 @@ object IrisDaemonSync {
     }
 
     /** Returns true if an update was installed and the daemon was told to restart. */
-    private fun updateDaemonIfBundledNewer(context: Context, status: DaemonStatus): Boolean {
+    private fun updateDaemonIfBundledNewer(context: Context, status: DaemonInfo): Boolean {
         val assets = context.assets
         val bundledVersion = try {
             assets.open("$ASSET_DIR/VERSION").bufferedReader().use { it.readText().trim() }

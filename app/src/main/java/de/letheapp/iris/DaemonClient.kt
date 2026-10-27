@@ -8,7 +8,7 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 
 /** What the running irisd reports about itself (STATUS). */
-data class DaemonStatus(
+data class DaemonInfo(
     val daemonVersion: String,
     /** 1 = pre-command daemon (push fan-out + STATUS only), 2+ = understands REGISTER/INSTALL/... */
     val protocolVersion: Int,
@@ -30,9 +30,9 @@ object DaemonClient {
     private const val IO_TIMEOUT_MS = 5_000
     private val gson = Gson()
 
-    fun status(): DaemonStatus? {
+    fun status(): DaemonInfo? {
         val reply = request("STATUS", null) { it.get("type")?.asString == "status" } ?: return null
-        return DaemonStatus(
+        return DaemonInfo(
             daemonVersion = reply.get("daemon_version")?.asString ?: return null,
             protocolVersion = reply.get("protocol_version")?.asInt ?: 1,
             isOverride = reply.get("override")?.asBoolean ?: false,
