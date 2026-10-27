@@ -24,7 +24,13 @@ object IrisDelivery {
             ContextCompat.startForegroundService(context, Intent(context, IrisBridgeService::class.java))
         } else {
             context.stopService(Intent(context, IrisBridgeService::class.java))
-            ContextCompat.startForegroundService(context, Intent(context, IrisPushService::class.java))
+            try {
+                ContextCompat.startForegroundService(context, Intent(context, IrisPushService::class.java))
+            } catch (e: Exception) {
+                // Background start refused (no battery-optimization exemption): fine as
+                // long as the service already runs - just let it pick up the change.
+                if (!IrisPushService.resyncIfRunning()) throw e
+            }
         }
     }
 

@@ -67,39 +67,66 @@ Content-Type: application/json
   was handed to a currently-connected client, not that the receiving app
   acted on it.
 
+## Registration on-device
+
+An app hands Iris its token itself (no user step), after obtaining it from
+`/push/register` (or, for Lethe, `/push/tokens`):
+
+```kotlin
+sendBroadcast(Intent("de.letheapp.iris.action.REGISTER").apply {
+    setPackage("de.letheapp.iris")
+    putExtra("package_name", packageName)
+    putExtra("token", token)
+    // Proof of identity: the system fills in the creator package of a
+    // PendingIntent, so Iris can verify package_name wasn't spoofed.
+    putExtra("app", PendingIntent.getBroadcast(this, 0, Intent(this, MyIrisReceiver::class.java), PendingIntent.FLAG_IMMUTABLE))
+})
+```
+
+Iris answers with `de.letheapp.iris.action.REGISTERED` (extras
+`package_name`, `token`) once it is actually receiving for that app. If the
+server later rejects the token (WebSocket close `4001`), Iris drops the
+registration and sends `de.letheapp.iris.action.UNREGISTERED` - fetch a new
+token and register again. `de.letheapp.iris.action.UNREGISTER` (same extras
+plus `app`) removes a registration.
+
+The app needs `<queries><package android:name="de.letheapp.iris"/></queries>`
+(Android 11+) to see and reach Iris.
+
 ## Delivery to the target app on-device
 
-This repo's reference client (`IrisPushService`) is deliberately generic: it
-doesn't know anything about the app it delivers to beyond its package name.
-On receiving a push over the WebSocket, it broadcasts:
+On receiving a push over the WebSocket, Iris (or, on OS builds, the native
+`irisd` daemon directly via ActivityManager) sends an explicit broadcast to
+the target package:
 
 - Action: `de.letheapp.iris.PUSH`
-- Protected by permission: `de.letheapp.iris.RECEIVE_PUSH` (`protectionLevel="signature"`)
-- Extras: `package_name`, `title`, `body`, `data_json` (the `data` object, re-serialized to a JSON string)
+- Flags: `FLAG_RECEIVER_FOREGROUND | FLAG_INCLUDE_STOPPED_PACKAGES`
+- Extras: `package_name`, `token`, `title`, `body`, `data_json` (the `data`
+  object, re-serialized to a JSON string)
 
-A receiving app needs to:
+Like an FCM message, this **starts the target app's process** for its
+manifest receiver - the app does not need any running service or
+connection of its own. A receiving app needs to:
 
-1. Hold `de.letheapp.iris.RECEIVE_PUSH` — which, because it's
-   signature-protected, means it must be **signed with the same key** as the
-   Iris build it talks to. This is the security boundary: arbitrary installed
-   apps cannot register a receiver for pushes meant for someone else. It's
-   the right fit for apps bundled into the same custom-OS/ROM image, signed
-   with one key; it's the wrong fit for an app you expect strangers to
-   install standalone — for that, run your own Iris build signed with your
-   own key and ship it alongside your app.
-2. Declare a `<receiver>` with an `<intent-filter>` for
-   `de.letheapp.iris.PUSH`, and turn the extras into whatever local
-   notification/UI update it needs.
+1. Declare an exported `<receiver>` with an `<intent-filter>` for
+   `de.letheapp.iris.PUSH` (and `REGISTERED` / `UNREGISTERED`).
+2. **Drop every PUSH whose `token` extra isn't the token it registered.** The
+   receiver is necessarily exported, so any app could send it a fake PUSH;
+   the token is only known to the app, its server and Iris.
+3. Turn the extras into whatever local notification/UI update it needs,
+   within the ~10s a receiver may run (`goAsync()`).
+
+The broadcast deliberately carries no permission: a signature permission
+would only work for apps signed with the same key as Iris, which rules out
+apps installed from F-Droid/Play.
 
 ## Known limitations (v1)
 
-- **Single-instance delivery.** The reference server keeps WebSocket
-  connections in local memory per backend process. If you run Iris behind a
-  load balancer with multiple instances, a `/push/send` call only succeeds if
-  it happens to land on the instance holding that device's connection.
-  Fixing this generically needs a shared routing layer (e.g. Redis pub/sub)
-  across instances — out of scope for this reference implementation, but
-  straightforward to add if you're already running one.
+- **Multi-instance routing needs a shared layer.** The reference server keeps
+  WebSocket connections in local memory per backend process. The Lethe
+  backend routes across instances via Redis pub/sub (`iris_instance` hash +
+  `iris:instance:<id>` channels); a custom server behind a load balancer
+  needs something equivalent.
 - **No offline queueing.** A push sent while the device is disconnected is
   simply dropped; there's no store-and-forward.
 - **No delivery receipts.** The server only knows a frame was written to the

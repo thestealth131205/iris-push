@@ -152,16 +152,11 @@ class IrisBridgeService : Service() {
         val body = obj.get("body")?.asString ?: ""
         val dataJson = obj.get("data_json")?.toString() ?: "{}"
 
-        sendBroadcast(
-            Intent(IrisPushService.ACTION_PUSH).apply {
-                setPackage(targetPackage)
-                putExtra(IrisPushService.EXTRA_PACKAGE_NAME, targetPackage)
-                putExtra(IrisPushService.EXTRA_TITLE, title)
-                putExtra(IrisPushService.EXTRA_BODY, body)
-                putExtra(IrisPushService.EXTRA_DATA_JSON, dataJson)
-            },
-            IrisPushService.PERMISSION_RECEIVE_PUSH
-        )
+        // irisd >= 1.3.0 sends the token along; older daemons don't, so look it up.
+        val token = obj.get("token")?.asString
+            ?: IrisConfig.getRegistrations(this).firstOrNull { it.packageName == targetPackage }?.token
+            ?: return
+        PushDelivery.deliver(this, targetPackage, token, title, body, dataJson)
     }
 
     private fun createNotificationChannel() {

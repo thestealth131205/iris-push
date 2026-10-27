@@ -111,14 +111,15 @@ in the Lethe backend if you want a working example to read.
 - Tokens are bearer credentials, exactly like an FCM device token: whoever
   holds one can push to it, and whoever's server issued it can see which
   app/device it belongs to. Treat them with the same care.
-- The on-device broadcast (`de.letheapp.iris.PUSH`) requires the
-  `de.letheapp.iris.RECEIVE_PUSH` signature permission, so only apps signed
-  with the *same key* as this Iris build can receive it. That's intentional:
-  it's the right model when Iris and your app ship together in one signed
-  image (a custom ROM, an APK bundle you control end to end). If you're
-  distributing your app independently and expect it to talk to a
-  third-party-signed Iris build, this permission model won't grant access —
-  build and sign your own Iris APK instead, keyed to your app.
+- The on-device broadcast (`de.letheapp.iris.PUSH`) is explicit (sent only to
+  the registered package) and carries the token the app registered with;
+  the receiving app must drop any PUSH whose token isn't its own, because its
+  receiver is exported. No signature permission is involved, so apps from
+  F-Droid/Play (signed with their own keys) work with the official Iris APK.
+- Registration (`de.letheapp.iris.action.REGISTER`) is open to every app, but
+  the sender proves its package with a PendingIntent (creator package is set
+  by the system), so one app can't overwrite another's registration. See
+  PROTOCOL.md.
 
 ## Building
 

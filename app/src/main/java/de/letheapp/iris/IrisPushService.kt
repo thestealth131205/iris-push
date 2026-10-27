@@ -45,19 +45,29 @@ import java.util.concurrent.TimeUnit
 class IrisPushService : Service() {
 
     companion object {
-        const val ACTION_PUSH = "de.letheapp.iris.PUSH"
-        const val PERMISSION_RECEIVE_PUSH = "de.letheapp.iris.RECEIVE_PUSH"
-        const val EXTRA_PACKAGE_NAME = "package_name"
-        const val EXTRA_TITLE = "title"
-        const val EXTRA_BODY = "body"
-        const val EXTRA_DATA_JSON = "data_json"
-
         private const val CHANNEL_ID = "iris_connection"
         private const val NOTIFICATION_ID = 1
         private const val PING_INTERVAL_MS = 45_000L
         private const val RECONNECT_DELAY_MS = 5_000L
+        private const val CLOSE_TOKEN_REJECTED = 4001
 
         private val _connectionStatus = MutableStateFlow<Map<String, Boolean>>(emptyMap())
+
+        @Volatile private var running: IrisPushService? = null
+
+        /**
+         * Picks up added/removed registrations in an already running service without a
+         * new startForegroundService() call - that call is refused from the background
+         * (Android 12+) unless Iris is exempt from battery optimization. Returns false
+         * if the service isn't running.
+         */
+        fun isRunning(): Boolean = running != null
+
+        fun resyncIfRunning(): Boolean {
+            val service = running ?: return false
+            android.os.Handler(android.os.Looper.getMainLooper()).post { service.syncConnections() }
+            return true
+        }
 
         /** package_name -> currently connected, for every app this service is handling. */
         val connectionStatus: StateFlow<Map<String, Boolean>> = _connectionStatus.asStateFlow()
@@ -82,6 +92,7 @@ class IrisPushService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        running = this
         IrisLog.log(this, "IrisPushService", "onCreate")
     }
 
@@ -119,6 +130,7 @@ class IrisPushService : Service() {
 
     override fun onDestroy() {
         IrisLog.log(this, "IrisPushService", "onDestroy (${jobs.size} aktive Verbindung(en))")
+        if (running === this) running = null
         for ((pkg, job) in jobs) {
             job.cancel()
             setStatus(pkg, null)
@@ -144,7 +156,7 @@ class IrisPushService : Service() {
     }
 
     /** Starts a connectLoop for every newly-registered app, cancels one for every removed app. */
-    private fun syncConnections() {
+    fun syncConnections() {
         val registrations = IrisConfig.getRegistrations(this).associateBy { it.packageName }
 
         for (pkg in jobs.keys.toList()) {
@@ -197,16 +209,23 @@ class IrisPushService : Service() {
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (text == "pong") return
-                handleIncoming(reg.packageName, text)
+                handleIncoming(reg, text)
+            }
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                webSocket.close(code, null)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 IrisLog.log(this@IrisPushService, "IrisPushService", "${reg.packageName}: Verbindung geschlossen ($code $reason)")
+                if (code == CLOSE_TOKEN_REJECTED) onTokenRejected(reg)
                 closed.complete(Unit)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 IrisLog.log(this@IrisPushService, "IrisPushService", "${reg.packageName}: Verbindung fehlgeschlagen: ${t.javaClass.simpleName}: ${t.message}")
+                // Older servers reject unknown tokens before the handshake (HTTP 403).
+                if (response?.code == 403) onTokenRejected(reg)
                 closed.complete(Unit)
             }
         }
@@ -224,7 +243,7 @@ class IrisPushService : Service() {
         }
     }
 
-    private fun handleIncoming(targetPackage: String, text: String) {
+    private fun handleIncoming(reg: IrisRegistration, text: String) {
         val type = object : TypeToken<Map<String, Any?>>() {}.type
         val payload: Map<String, Any?> = try {
             gson.fromJson(text, type)
@@ -238,16 +257,23 @@ class IrisPushService : Service() {
         val data = payload["data"]
         val dataJson = if (data != null) gson.toJson(data) else "{}"
 
-        sendBroadcast(
-            Intent(ACTION_PUSH).apply {
-                setPackage(targetPackage)
-                putExtra(EXTRA_PACKAGE_NAME, targetPackage)
-                putExtra(EXTRA_TITLE, title)
-                putExtra(EXTRA_BODY, body)
-                putExtra(EXTRA_DATA_JSON, dataJson)
-            },
-            PERMISSION_RECEIVE_PUSH
-        )
+        PushDelivery.deliver(this, reg.packageName, reg.token, title, body, dataJson)
+    }
+
+    /**
+     * Server closed with 4001: token unknown/revoked (e.g. replaced by a newer one for
+     * the same account). Drop it so connectLoop stops retrying a dead token, and tell
+     * the app - it fetches a new token and registers again.
+     */
+    private fun onTokenRejected(reg: IrisRegistration) {
+        IrisLog.log(this, "IrisPushService", "${reg.packageName}: Token vom Server abgelehnt – Registrierung entfernt, App informiert")
+        if (IrisConfig.getRegistrations(this).any { it.packageName == reg.packageName && it.token == reg.token }) {
+            IrisConfig.removeRegistration(this, reg.packageName)
+        }
+        PushDelivery.notifyUnregistered(this, reg.packageName, reg.token)
+        scope.launch(Dispatchers.Main) {
+            if (IrisConfig.isConfigured(this@IrisPushService)) syncConnections() else stopSelf()
+        }
     }
 
     private fun createNotificationChannel() {

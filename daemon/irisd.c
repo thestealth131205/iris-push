@@ -41,6 +41,7 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/inotify.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <ctype.h>
 #include <netdb.h>
@@ -67,10 +68,11 @@
 #define PING_INTERVAL_SEC 45
 #define RECV_TIMEOUT_SEC 5
 #define RECONNECT_DELAY_SEC 5
+#define TOKEN_REJECTED_DELAY_SEC 300
 #define MAX_BRIDGE_CLIENTS 8
 #define MAX_LINE 8192
 #ifndef IRISD_VERSION
-#define IRISD_VERSION "1.2.0"
+#define IRISD_VERSION "1.3.0"
 #endif
 /* Bumped only on incompatible control-socket changes. Commands are
  * additive-only; unknown commands are ignored, so older apps keep working
@@ -155,6 +157,33 @@ static void bridge_send_to(int fd, const char *line) {
  * parser (e.g. cJSON) if this ever needs to accept push payloads from
  * untrusted third parties. */
 
+static void utf8_put(char *out, size_t *i, size_t out_sz, unsigned cp) {
+    char tmp[4]; int n;
+    if (cp < 0x80) { tmp[0] = (char)cp; n = 1; }
+    else if (cp < 0x800) { tmp[0] = (char)(0xC0 | (cp >> 6)); tmp[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
+    else if (cp < 0x10000) { tmp[0] = (char)(0xE0 | (cp >> 12)); tmp[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); tmp[2] = (char)(0x80 | (cp & 0x3F)); n = 3; }
+    else { tmp[0] = (char)(0xF0 | (cp >> 18)); tmp[1] = (char)(0x80 | ((cp >> 12) & 0x3F)); tmp[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); tmp[3] = (char)(0x80 | (cp & 0x3F)); n = 4; }
+    if (*i + (size_t)n + 1 > out_sz) return;
+    memcpy(out + *i, tmp, (size_t)n);
+    *i += (size_t)n;
+}
+
+static int hex4(const char *p, unsigned *out) {
+    unsigned v = 0;
+    for (int k = 0; k < 4; k++) {
+        char c = p[k];
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10);
+        else return 0;
+    }
+    *out = v;
+    return 1;
+}
+
+/* Finds "key":"value" and writes the JSON-unescaped value (\n, \", \uXXXX
+ * incl. surrogate pairs -> UTF-8) to out. */
 static int json_find_string(const char *json, const char *key, char *out, size_t out_sz) {
     char needle[128];
     snprintf(needle, sizeof(needle), "\"%s\"", key);
@@ -168,11 +197,48 @@ static int json_find_string(const char *json, const char *key, char *out, size_t
     p++;
     size_t i = 0;
     while (*p && *p != '"' && i + 1 < out_sz) {
-        if (*p == '\\' && p[1]) p++;
-        out[i++] = *p++;
+        if (*p != '\\') { out[i++] = *p++; continue; }
+        p++;
+        switch (*p) {
+            case 'n': out[i++] = '\n'; p++; break;
+            case 't': out[i++] = '\t'; p++; break;
+            case 'r': out[i++] = '\r'; p++; break;
+            case 'b': out[i++] = '\b'; p++; break;
+            case 'f': out[i++] = '\f'; p++; break;
+            case 'u': {
+                unsigned cp;
+                if (!hex4(p + 1, &cp)) { p++; break; }
+                p += 5;
+                if (cp >= 0xD800 && cp <= 0xDBFF && p[0] == '\\' && p[1] == 'u') {
+                    unsigned lo;
+                    if (hex4(p + 2, &lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        p += 6;
+                    }
+                }
+                utf8_put(out, &i, out_sz, cp);
+                break;
+            }
+            case '\0': break;
+            default: out[i++] = *p++; break; /* \" \\ \/ */
+        }
     }
     out[i] = '\0';
     return 1;
+}
+
+/* JSON-escapes in into out (for re-embedding unescaped strings in a JSON line). */
+static void json_escape(const char *in, char *out, size_t out_sz) {
+    size_t i = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && i + 7 < out_sz; p++) {
+        if (*p == '"' || *p == '\\') { out[i++] = '\\'; out[i++] = (char)*p; }
+        else if (*p == '\n') { out[i++] = '\\'; out[i++] = 'n'; }
+        else if (*p == '\r') { out[i++] = '\\'; out[i++] = 'r'; }
+        else if (*p == '\t') { out[i++] = '\\'; out[i++] = 't'; }
+        else if (*p < 0x20) i += (size_t)snprintf(out + i, out_sz - i, "\\u%04x", *p);
+        else out[i++] = (char)*p;
+    }
+    out[i] = '\0';
 }
 
 /* Extracts the raw substring of a top-level JSON object value (balanced
@@ -600,6 +666,52 @@ static void report_installed(const token_cfg_t *cfg) {
     close(fd);
 }
 
+/* ---------- direct delivery: wake the target app via ActivityManager ----------
+ * On an OS build irisd hands each push straight to the target app as an
+ * explicit broadcast (setPackage = target), the same way GMS wakes FCM
+ * clients: Android starts the app's process for its manifest receiver, the
+ * app shows its notification, and nothing on the app side has to stay
+ * running. Done via `cmd activity broadcast` (exec'd directly, no shell, so
+ * payload strings can't inject anything). Needs the SELinux rules in
+ * sepolicy/irisd.te (binder_call/activity_service). Returns 0 on success; on
+ * failure the caller falls back to the IrisBridgeService socket path. */
+#define CMD_BIN "/system/bin/cmd"
+/* Intent.FLAG_RECEIVER_FOREGROUND | Intent.FLAG_INCLUDE_STOPPED_PACKAGES */
+#define DIRECT_BROADCAST_FLAGS "268435488"
+
+static int deliver_broadcast(const char *action, const char *pkg, const char *const *extras) {
+#ifdef __ANDROID__
+    const char *argv[40];
+    int n = 0;
+    argv[n++] = CMD_BIN; argv[n++] = "activity"; argv[n++] = "broadcast";
+    argv[n++] = "--user"; argv[n++] = "0";
+    argv[n++] = "-a"; argv[n++] = action;
+    argv[n++] = "-p"; argv[n++] = pkg;
+    argv[n++] = "-f"; argv[n++] = DIRECT_BROADCAST_FLAGS;
+    for (int k = 0; extras && extras[k] && extras[k + 1] && n < 36; k += 2) {
+        argv[n++] = "--es"; argv[n++] = extras[k]; argv[n++] = extras[k + 1];
+    }
+    argv[n] = NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
+        execv(CMD_BIN, (char *const *)argv);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+#else
+    (void)action; (void)pkg; (void)extras;
+    return -1; /* standalone/dev build: always use the bridge socket */
+#endif
+}
+
 static void *conn_thread_main(void *arg) {
     conn_arg_t *a = (conn_arg_t *)arg;
     token_cfg_t *cfg = &a->cfg;
@@ -649,6 +761,7 @@ static void *conn_thread_main(void *arg) {
         report_installed(cfg);
 
         time_t last_ping = time(NULL);
+        int token_rejected = 0;
         unsigned char payload[MAX_LINE];
         while (!a->stop) {
             size_t payload_len = 0;
@@ -673,18 +786,42 @@ static void *conn_thread_main(void *arg) {
                         json_find_string((char *)payload, "body", body, sizeof(body));
                         json_find_raw_object((char *)payload, "data", data_json, sizeof(data_json));
 
-                        char line[MAX_LINE];
-                        snprintf(line, sizeof(line),
-                            "{\"package_name\":\"%s\",\"title\":\"%s\",\"body\":\"%s\",\"data_json\":%s}",
-                            cfg->package_name, title, body,
-                            data_json[0] ? data_json : "\"{}\"");
-                        bridge_broadcast(line);
+                        const char *extras[] = {
+                            "package_name", cfg->package_name,
+                            "token", cfg->token,
+                            "title", title,
+                            "body", body,
+                            "data_json", data_json[0] ? data_json : "{}",
+                            NULL
+                        };
+                        if (deliver_broadcast("de.letheapp.iris.PUSH", cfg->package_name, extras) == 0) {
+                            LOGI("[%s] push delivered directly", cfg->package_name);
+                        } else {
+                            char title_esc[1536], body_esc[6144];
+                            json_escape(title, title_esc, sizeof(title_esc));
+                            json_escape(body, body_esc, sizeof(body_esc));
+                            char line[MAX_LINE * 2];
+                            snprintf(line, sizeof(line),
+                                "{\"package_name\":\"%s\",\"token\":\"%s\",\"title\":\"%s\",\"body\":\"%s\",\"data_json\":%s}",
+                                cfg->package_name, cfg->token, title_esc, body_esc,
+                                data_json[0] ? data_json : "{}");
+                            bridge_broadcast(line);
+                        }
                     }
                 }
             } else if (opcode == 0x9) { /* ping from server */
                 ws_send_pong(&io, payload, payload_len);
             } else if (opcode == 0x8) { /* close */
-                LOGI("[%s] server closed connection", cfg->package_name);
+                int code = payload_len >= 2 ? ((payload[0] << 8) | payload[1]) : 0;
+                LOGI("[%s] server closed connection (code %d)", cfg->package_name, code);
+                if (code == 4001) {
+                    /* Token unknown/revoked server-side: tell the app so it fetches a
+                     * new one and re-registers (which rewrites our config file), and
+                     * stop hammering the server with the dead token meanwhile. */
+                    const char *extras[] = { "package_name", cfg->package_name, "token", cfg->token, NULL };
+                    deliver_broadcast("de.letheapp.iris.action.UNREGISTERED", cfg->package_name, extras);
+                    token_rejected = 1;
+                }
                 break;
             }
 
@@ -698,7 +835,7 @@ static void *conn_thread_main(void *arg) {
         a->connected = 0;
         if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
         close(fd);
-        if (!a->stop) sleep(RECONNECT_DELAY_SEC);
+        if (!a->stop) sleep(token_rejected ? TOKEN_REJECTED_DELAY_SEC : RECONNECT_DELAY_SEC);
     }
 
     if (ssl_ctx) SSL_CTX_free(ssl_ctx);

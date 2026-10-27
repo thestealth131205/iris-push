@@ -55,16 +55,17 @@ disk across restarts.
 
 ## Registration from other apps
 
-An app signed with the same key broadcasts to Iris after its own
-`/push/register`:
+Apps register with the Iris app (not with irisd directly) via the
+`de.letheapp.iris.action.REGISTER` broadcast described in PROTOCOL.md
+("Registration on-device"); the app forwards it here as `REGISTER`.
 
-```kotlin
-sendBroadcast(Intent("de.letheapp.iris.action.REGISTER").apply {
-    setPackage("de.letheapp.iris")
-    putExtra("package_name", packageName)
-    putExtra("token", token)
-}, "de.letheapp.iris.permission.REGISTER")
-```
+## Delivery (irisd >= 1.3.0)
 
-`de.letheapp.iris.action.UNREGISTER` with `package_name` removes it. The
-calling app needs `<uses-permission android:name="de.letheapp.iris.permission.REGISTER"/>`.
+irisd hands each push straight to the target app by exec'ing
+`/system/bin/cmd activity broadcast -a de.letheapp.iris.PUSH -p <pkg> ...`
+(no shell, payload passed as separate argv), which starts the target app's
+process like an FCM message would. Only if that fails (e.g. SELinux denials
+before sepolicy/iris_daemon.te is complete) does it fall back to writing the
+push line to connected bridge clients; that line now also carries `token`.
+On a server close with code 4001 irisd broadcasts
+`de.letheapp.iris.action.UNREGISTERED` to the app and backs off 5 minutes.

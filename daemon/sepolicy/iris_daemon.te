@@ -43,3 +43,16 @@ allow iris_daemon iris_update_file:file { create_file_perms execute execute_no_t
 type iris_daemon_socket, file_type;
 allow iris_daemon iris_daemon_socket:sock_file { create setattr unlink write };
 allow iris_daemon self:unix_stream_socket { create_stream_socket_perms listen accept };
+
+# Direct delivery (irisd >= 1.3.0): each push is handed to the target app via
+# exec of /system/bin/cmd -> "activity broadcast" (see deliver_broadcast() in
+# irisd.c), so the app is woken by ActivityManager like an FCM client and the
+# Iris app doesn't have to relay anything. If these are denied, irisd falls
+# back to the IrisBridgeService socket path automatically - check dmesg for
+# avc denials of iris_daemon against system_server/activity_service.
+allow iris_daemon system_file:file { execute execute_no_trans };
+binder_use(iris_daemon)
+binder_call(iris_daemon, system_server)
+binder_call(system_server, iris_daemon) # cmd's ShellCallback/ResultReceiver
+allow iris_daemon activity_service:service_manager find;
+allow system_server iris_daemon:fd use;
