@@ -1,0 +1,11 @@
+# App side of the control socket. The Iris app is a platform-signed priv-app,
+# i.e. it runs in platform_app. These two rules are all that lets it (and,
+# via DAC 0666 on the socket, only domains granted here) reach irisd for
+# the push fan-out and for REGISTER / INSTALL / RELOAD.
+#
+# Merge into the tree's sepolicy next to iris_daemon.te. If you would rather
+# not extend platform_app for every platform-signed app, give Iris its own
+# domain (seapp_contexts entry for de.letheapp.iris) and grant these there.
+
+allow platform_app iris_daemon_socket:sock_file write;
+allow platform_app iris_daemon:unix_stream_socket connectto;

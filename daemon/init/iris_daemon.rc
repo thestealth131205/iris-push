@@ -1,26 +1,32 @@
-# Merge this into your OS tree's init.rc includes (or let Soong install it
-# via Android.bp's init_rc property, which copies it to /system/etc/init/
-# automatically - either way it needs to end up somewhere init reads at
-# boot).
+# Installed to /system/etc/init/ by Android.bp (init_rc). Needs the "iris"
+# AID and sepolicy/iris_daemon.te from this directory in the OS tree.
 #
-# `class core` starts irisd early and keeps it running across most of the
-# boot lifecycle, same tier as netd/rild. The `socket` line asks init to
-# pre-create and bind a UNIX domain stream socket at /dev/socket/iris_daemon
-# *before* irisd runs, then hand it the already-bound fd via the
-# ANDROID_SOCKET_iris_daemon environment variable - irisd just needs to
-# listen()+accept() on it (see create_bridge_listen_socket() in irisd.c).
+# Directory layout (all owned by iris, created by init so no app needs
+# write access to /data/misc/iris):
+#   tokens/  one <package>.conf per registered app, written by irisd itself
+#            in response to REGISTER on the control socket
+#   bin/     signed irisd update (irisd, irisd.sig, irisd.ver), written by
+#            irisd in response to INSTALL; the image copy execs it at start
 #
-# `user iris` / `group iris inet` requires a dedicated "iris" AID to exist
-# in your build (see OS_INTEGRATION_PLAN.md step 4) - `inet` grants raw
-# socket creation for the outbound TLS/WebSocket connections.
+# `socket` makes init create /dev/socket/iris_daemon before irisd runs and
+# hand it over as ANDROID_SOCKET_iris_daemon. It is 0666 on purpose: the Iris
+# app runs as its own platform_app uid (not system, not in group iris), so
+# DAC can't single it out - access is restricted by SELinux instead
+# (see sepolicy/iris_app.te).
 #
-# seclabel assumes you've authored sepolicy/iris_daemon.te (also in this
-# directory) into your device's sepolicy sources.
+# Not oneshot: when irisd exits (crash, or the RELOAD command after an
+# update) init restarts it and the new binary is picked up.
+
+on post-fs-data
+    mkdir /data/misc/iris 0771 iris iris
+    mkdir /data/misc/iris/tokens 0770 iris iris
+    mkdir /data/misc/iris/bin 0750 iris iris
+    restorecon_recursive /data/misc/iris
 
 service iris_daemon /system/bin/irisd
     class core
     user iris
     group iris inet
-    socket iris_daemon stream 0660 system iris
+    socket iris_daemon stream 0666 iris iris
     seclabel u:r:iris_daemon:s0
     writepid /dev/cpuset/system-background/tasks

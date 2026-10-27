@@ -19,6 +19,9 @@ cc_binary {
         "-Wall",
         "-Wextra",
         "-DANDROID_BUILD",
+        // Release public key for signed daemon updates (tools/sign-irisd.sh
+        // genkey prints it). Without it INSTALL is disabled:
+        // "-DIRISD_UPDATE_PUBKEY_HEX=\"<64 hex chars>\"",
     ],
     shared_libs: [
         "libssl",

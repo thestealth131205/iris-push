@@ -103,6 +103,8 @@ class IrisBridgeService : Service() {
         socket.connect(LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.RESERVED))
         socket.use {
             updateNotification("Verbunden mit Systemdienst")
+            // Replay registrations / hand over a newer bundled irisd (own connection, off the push reader)
+            scope.launch { IrisDaemonSync.onBridgeConnected(this@IrisBridgeService) }
             val reader = BufferedReader(InputStreamReader(it.inputStream))
             while (scope.isActive) {
                 val line = reader.readLine() ?: break

@@ -1,0 +1,107 @@
+name: irisd (signed update build)
+
+# Baut irisd fuer Android (arm64-v8a) mit statisch gelinktem OpenSSL, signiert es
+# mit dem Update-Schluessel und legt die Dateien im Asset-Layout der Iris-APK ab:
+#   assets/irisd/VERSION
+#   assets/irisd/arm64-v8a/irisd
+#   assets/irisd/arm64-v8a/irisd.sig
+# Secrets: IRISD_UPDATE_KEY (PEM, privat), IRISD_UPDATE_PUBKEY_HEX (oeffentlich).
+# Release: Tag "irisd-v<version>" pushen; <version> muss zu IRISD_VERSION passen.
+
+on:
+  push:
+    tags: ['irisd-v*']
+  workflow_dispatch:
+
+env:
+  OPENSSL_VERSION: 3.5.9
+  OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+  ANDROID_API: '26'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        run: |
+          VERSION=$(grep -oP '#define IRISD_VERSION "\K[^"]+' daemon/irisd.c)
+          echo "IRISD_VERSION=${VERSION}" >> "$GITHUB_ENV"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "irisd-v${VERSION}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} passt nicht zu IRISD_VERSION ${VERSION}" >&2
+            exit 1
+          fi
+
+      - name: Check signing secrets
+        env:
+          IRISD_UPDATE_KEY: ${{ secrets.IRISD_UPDATE_KEY }}
+          IRISD_UPDATE_PUBKEY_HEX: ${{ secrets.IRISD_UPDATE_PUBKEY_HEX }}
+        run: |
+          [ -n "$IRISD_UPDATE_KEY" ] && [ -n "$IRISD_UPDATE_PUBKEY_HEX" ] || { echo "Secrets fehlen" >&2; exit 1; }
+          umask 077
+          printf '%s\n' "$IRISD_UPDATE_KEY" > "$RUNNER_TEMP/update.pem"
+          # Der Schluessel muss zum einkompilierten Public Key passen, sonst lehnt der Daemon jedes Update ab.
+          DERIVED=$(openssl pkey -in "$RUNNER_TEMP/update.pem" -pubout -outform DER | tail -c 32 | xxd -p -c64)
+          [ "$DERIVED" = "$IRISD_UPDATE_PUBKEY_HEX" ] || { echo "Private key passt nicht zu IRISD_UPDATE_PUBKEY_HEX" >&2; exit 1; }
+
+      - name: Fetch OpenSSL (pinned checksum)
+        run: |
+          curl -fsSLo openssl.tar.gz "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          echo "${OPENSSL_SHA256}  openssl.tar.gz" | sha256sum -c -
+          tar xzf openssl.tar.gz
+
+      - name: Build static OpenSSL for arm64-v8a
+        run: |
+          export ANDROID_NDK_ROOT="$ANDROID_NDK_LATEST_HOME"
+          export PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          cd "openssl-${OPENSSL_VERSION}"
+          ./Configure android-arm64 -D__ANDROID_API__="${ANDROID_API}" no-shared no-tests no-apps no-docs \
+            --prefix="$GITHUB_WORKSPACE/openssl-android" --openssldir=/system/etc/security
+          make -j"$(nproc)" build_libs
+          make install_dev
+
+      - name: Build irisd
+        run: |
+          export PATH="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          mkdir -p out/assets/irisd/arm64-v8a
+          aarch64-linux-android${ANDROID_API}-clang -O2 -Wall -Wextra -pthread -fPIE -pie \
+            -DANDROID_BUILD -DIRISD_STATIC_OPENSSL \
+            -DIRISD_VERSION="\"${IRISD_VERSION}\"" \
+            -DIRISD_UPDATE_PUBKEY_HEX="\"${{ secrets.IRISD_UPDATE_PUBKEY_HEX }}\"" \
+            -I openssl-android/include \
+            daemon/irisd.c \
+            openssl-android/lib*/libssl.a openssl-android/lib*/libcrypto.a \
+            -llog -o out/assets/irisd/arm64-v8a/irisd
+          llvm-strip out/assets/irisd/arm64-v8a/irisd
+          printf '%s\n' "${IRISD_VERSION}" > out/assets/irisd/VERSION
+
+      - name: Sign
+        run: |
+          sh daemon/tools/sign-irisd.sh sign "$RUNNER_TEMP/update.pem" \
+            out/assets/irisd/arm64-v8a/irisd "${IRISD_VERSION}" out/assets/irisd/arm64-v8a/irisd.sig
+          # Gegenprobe mit dem Public Key, genau das Format, das irisd prueft
+          { printf 'irisd %s\n' "${IRISD_VERSION}"; cat out/assets/irisd/arm64-v8a/irisd; } > "$RUNNER_TEMP/msg"
+          openssl pkey -in "$RUNNER_TEMP/update.pem" -pubout -out "$RUNNER_TEMP/pub.pem"
+          openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/pub.pem" \
+            -in "$RUNNER_TEMP/msg" -sigfile out/assets/irisd/arm64-v8a/irisd.sig
+          shred -u "$RUNNER_TEMP/update.pem" 2>/dev/null || rm -f "$RUNNER_TEMP/update.pem"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: irisd-${{ env.IRISD_VERSION }}
+          path: out/assets/irisd
+
+      - name: Attach to release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out/assets/irisd
+          tar czf "$GITHUB_WORKSPACE/irisd-${IRISD_VERSION}-assets.tar.gz" .
+          gh release create "$GITHUB_REF_NAME" "$GITHUB_WORKSPACE/irisd-${IRISD_VERSION}-assets.tar.gz" \
+            --repo "$GITHUB_REPOSITORY" --title "irisd ${IRISD_VERSION}" \
+            --notes "Signed irisd for the Iris APK (assets/irisd layout)." \
+          || gh release upload "$GITHUB_REF_NAME" "$GITHUB_WORKSPACE/irisd-${IRISD_VERSION}-assets.tar.gz" --clobber --repo "$GITHUB_REPOSITORY"

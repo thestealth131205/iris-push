@@ -26,7 +26,17 @@
         android:name="de.letheapp.iris.RECEIVE_PUSH"
         android:protectionLevel="signature" />
 
+    <!--
+         Other bundled apps (same signing key) register their push token with
+         Iris by broadcasting de.letheapp.iris.action.REGISTER, guarded by this.
+    -->
+    <permission
+        android:name="de.letheapp.iris.permission.REGISTER"
+        android:protectionLevel="signature" />
+
+    <!-- persistent only takes effect when installed as a platform-signed priv-app (OS build); ignored on a sideload. -->
     <application
+        android:persistent="true"
         android:name=".IrisApplication"
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -52,6 +62,16 @@
             android:name=".IrisBridgeService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <receiver
+            android:name=".RegistrationReceiver"
+            android:exported="true"
+            android:permission="de.letheapp.iris.permission.REGISTER">
+            <intent-filter>
+                <action android:name="de.letheapp.iris.action.REGISTER" />
+                <action android:name="de.letheapp.iris.action.UNREGISTER" />
+            </intent-filter>
+        </receiver>
 
         <receiver
             android:name=".BootReceiver"

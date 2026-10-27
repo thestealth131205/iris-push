@@ -2,7 +2,7 @@
 # verified policy - macro names/availability vary slightly across AOSP
 # versions and OEM forks. After flashing, drive the final version with
 # `dmesg | grep avc.*denied` + `audit2allow` during real use (daemon start,
-# a push round-trip, a bridge client connecting) rather than trusting this
+# REGISTER, a push round-trip, an INSTALL+RELOAD) rather than trusting this
 # file blindly. See OS_INTEGRATION_PLAN.md Tier 2, step 3.
 
 type iris_daemon, domain;
@@ -16,20 +16,30 @@ net_domain(iris_daemon)
 allow iris_daemon self:tcp_socket create_stream_socket_perms;
 allow iris_daemon self:udp_socket create_socket_perms; # DNS resolution
 
-# Per-app config files (server_url/token/package_name), read + the
-# directory watched via inotify for add/remove.
+# CA bundle for certificate validation.
+r_dir_file(iris_daemon, system_file)
+
+# Per-app config files (tokens/), written by irisd on REGISTER, read back
+# on start; the directory is watched via inotify.
 type iris_data_file, file_type, data_file_type;
-allow iris_daemon iris_data_file:dir rw_dir_perms;
+allow iris_daemon iris_data_file:dir create_dir_perms;
 allow iris_daemon iris_data_file:file create_file_perms;
 
-# The /dev/socket/iris_daemon control socket itself (init creates the sock
-# file; irisd just needs to operate on it once handed the fd).
-type iris_daemon_socket, file_type;
-allow iris_daemon iris_daemon_socket:sock_file write;
+# Signed daemon update (bin/): written by irisd on INSTALL, exec'd by the
+# image copy of irisd at start (no domain transition: same domain).
+#
+# VERIFY IN THE TREE: AOSP's domain.te carries neverallow rules against
+# executing files from data partitions. This tree is ours, so the fix is to
+# exempt iris_daemon / iris_update_file in those neverallow lines (and
+# keep the Ed25519 signature check in irisd.c as the real gate); do not
+# widen anything else. If that proves unacceptable, the fallback is a
+# dedicated /product/bin/irisd that only the OS image can replace.
+type iris_update_file, file_type, data_file_type;
+allow iris_daemon iris_update_file:dir create_dir_perms;
+allow iris_daemon iris_update_file:file { create_file_perms execute execute_no_trans map };
 
-# NOTE: no explicit rule is needed for apps (e.g. the Lethe Messenger
-# IrisBridgeService) to *connect* to the socket - that direction is
-# governed by the connecting app's own domain having permission to talk to
-# iris_daemon_socket, which needs its own allow rule in *that* domain's
-# .te file (or a generic rule if every priv-app on your OS should be able
-# to reach it). Add on the app side, not here.
+# The control socket itself (init creates the sock file; irisd accepts on
+# the inherited fd).
+type iris_daemon_socket, file_type;
+allow iris_daemon iris_daemon_socket:sock_file { create setattr unlink write };
+allow iris_daemon self:unix_stream_socket { create_stream_socket_perms listen accept };

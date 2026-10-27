@@ -41,6 +41,8 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/inotify.h>
+#include <fcntl.h>
+#include <ctype.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 
@@ -67,7 +69,19 @@
 #define RECONNECT_DELAY_SEC 5
 #define MAX_BRIDGE_CLIENTS 8
 #define MAX_LINE 8192
-#define IRISD_VERSION "1.1.0"
+#ifndef IRISD_VERSION
+#define IRISD_VERSION "1.2.0"
+#endif
+/* Bumped only on incompatible control-socket changes. Commands are
+ * additive-only; unknown commands are ignored, so older apps keep working
+ * against a newer daemon and vice versa (see CONTROL_PROTOCOL.md). */
+#define IRISD_PROTOCOL_VERSION 2
+#define MAX_UPDATE_BYTES (16u * 1024u * 1024u)
+#define BOOT_FAIL_LIMIT 3
+#define STABLE_AFTER_SEC 60
+
+static const char *g_config_dir = "/data/misc/iris/tokens";
+static const char *g_bin_dir = "/data/misc/iris/bin";
 
 /* ---------- bridge (daemon -> on-device app) client registry ---------- */
 
@@ -80,7 +94,7 @@ static void bridge_add_client(int fd) {
     if (g_bridge_fd_count < MAX_BRIDGE_CLIENTS) {
         g_bridge_fds[g_bridge_fd_count++] = fd;
     } else {
-        close(fd); /* no room - oldest-wins would need more bookkeeping, not worth it for v1 */
+        shutdown(fd, SHUT_RDWR); /* no room; the reader thread sees EOF and closes the fd */
     }
     pthread_mutex_unlock(&g_bridge_mutex);
 }
@@ -103,15 +117,15 @@ static void bridge_broadcast(const char *line) {
             g_bridge_fds[kept++] = fd;
         } else {
             LOGW("bridge client fd=%d write failed (errno=%d), dropping", fd, errno);
-            close(fd);
+            shutdown(fd, SHUT_RDWR); /* wakes the reader thread, which owns close() */
         }
     }
     g_bridge_fd_count = kept;
     pthread_mutex_unlock(&g_bridge_mutex);
 }
 
-/* Removes one client (e.g. once its reader thread sees EOF) without closing
- * it a second time - the reader thread already owns the close(). */
+/* Removes one client from the push fan-out (EOF, or UNSUBSCRIBE). Never
+ * closes it - the client's reader thread owns the close(). */
 static void bridge_remove_client(int fd) {
     pthread_mutex_lock(&g_bridge_mutex);
     int kept = 0;
@@ -314,6 +328,18 @@ static int load_token_cfg(const char *dir, const char *filename, token_cfg_t *cf
     snprintf(cfg->path, sizeof(cfg->path), "/iris/connect/%s", token);
     strncpy(cfg->token, token, sizeof(cfg->token) - 1);
     return 0;
+}
+
+/* Trust store. A system-image build links the platform's BoringSSL, whose
+ * defaults already point at the Android CA bundle. A statically linked
+ * OpenSSL (the signed update build, see .github/workflows/irisd.yml) has no
+ * idea where Android keeps its CAs, so name them explicitly. */
+static void load_ca_store(SSL_CTX *ctx) {
+    SSL_CTX_set_default_verify_paths(ctx);
+#ifdef IRISD_STATIC_OPENSSL
+    SSL_CTX_load_verify_locations(ctx, NULL, "/apex/com.android.conscrypt/cacerts");
+    SSL_CTX_load_verify_locations(ctx, NULL, "/system/etc/security/cacerts");
+#endif
 }
 
 /* ---------- WebSocket framing ---------- */
@@ -535,7 +561,7 @@ static void report_installed(const token_cfg_t *cfg) {
     if (cfg->use_tls) {
         ssl_ctx = SSL_CTX_new(TLS_client_method());
         SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
-        SSL_CTX_set_default_verify_paths(ssl_ctx);
+        load_ca_store(ssl_ctx);
         ssl = SSL_new(ssl_ctx);
         SSL_set_fd(ssl, fd);
         SSL_set_tlsext_host_name(ssl, cfg->host);
@@ -582,7 +608,7 @@ static void *conn_thread_main(void *arg) {
     if (cfg->use_tls) {
         ssl_ctx = SSL_CTX_new(TLS_client_method());
         SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
-        SSL_CTX_set_default_verify_paths(ssl_ctx);
+        load_ca_store(ssl_ctx);
     }
 
     while (!a->stop) {
@@ -719,12 +745,50 @@ static void spawn_for_file(const char *dir, const char *filename) {
     LOGI("spawned connection thread for %s (package=%s)", filename, cfg.package_name);
 }
 
+/* A REGISTER for an already-tracked package replaces its config file; if the
+ * server or token changed, retire the old connection thread and start a new
+ * one (in-place edits used to be ignored). */
+static void reconnect_if_changed(const char *dir, const char *filename) {
+    token_cfg_t now;
+    if (load_token_cfg(dir, filename, &now) != 0) return;
+
+    int changed = 0;
+    pthread_mutex_lock(&g_tracked_mutex);
+    tracked_t **pp = &g_tracked;
+    while (*pp) {
+        tracked_t *t = *pp;
+        if (strcmp(t->filename, filename) == 0) {
+            const token_cfg_t *old = &t->arg->cfg;
+            if (strcmp(old->path, now.path) != 0 || strcmp(old->host, now.host) != 0 ||
+                old->port != now.port || old->use_tls != now.use_tls) {
+                t->arg->stop = 1;
+                *pp = t->next;
+                free(t);
+                changed = 1;
+            }
+            break;
+        }
+        pp = &t->next;
+    }
+    pthread_mutex_unlock(&g_tracked_mutex);
+
+    if (changed) {
+        LOGI("config %s changed, reconnecting", filename);
+        spawn_for_file(dir, filename);
+    }
+}
+
 static int is_conf_file(const char *name) {
     size_t len = strlen(name);
     return len > 5 && strcmp(name + len - 5, ".conf") == 0;
 }
 
-static void rescan_dir(const char *dir) {
+/* rescan_dir runs from the inotify thread and, since REGISTER/UNREGISTER
+ * rescan synchronously, from bridge reader threads too - serialize them or
+ * both can see "not tracked yet" and spawn a duplicate connection. */
+static pthread_mutex_t g_rescan_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void rescan_dir_locked(const char *dir) {
     DIR *d = opendir(dir);
     if (!d) {
         LOGW("config dir %s not accessible: %s", dir, strerror(errno));
@@ -748,6 +812,7 @@ static void rescan_dir(const char *dir) {
         pthread_mutex_unlock(&g_tracked_mutex);
 
         if (!already) spawn_for_file(dir, ent->d_name);
+        else reconnect_if_changed(dir, ent->d_name);
     }
     closedir(d);
 
@@ -770,6 +835,12 @@ static void rescan_dir(const char *dir) {
         }
     }
     pthread_mutex_unlock(&g_tracked_mutex);
+}
+
+static void rescan_dir(const char *dir) {
+    pthread_mutex_lock(&g_rescan_mutex);
+    rescan_dir_locked(dir);
+    pthread_mutex_unlock(&g_rescan_mutex);
 }
 
 /* Builds the JSON line sent back in response to a "STATUS" request on the
@@ -795,8 +866,11 @@ static void build_status_json(char *out, size_t out_sz) {
     }
     pthread_mutex_unlock(&g_tracked_mutex);
 
-    snprintf(out, out_sz, "{\"type\":\"status\",\"daemon_version\":\"%s\",\"apps\":[%s]}",
-        IRISD_VERSION, apps_buf);
+    snprintf(out, out_sz,
+        "{\"type\":\"status\",\"daemon_version\":\"%s\",\"protocol_version\":%d,"
+        "\"override\":%s,\"apps\":[%s]}",
+        IRISD_VERSION, IRISD_PROTOCOL_VERSION,
+        getenv("IRISD_OVERRIDE") ? "true" : "false", apps_buf);
 }
 
 static void *watch_thread_main(void *arg) {
@@ -827,6 +901,324 @@ static void *watch_thread_main(void *arg) {
     return NULL;
 }
 
+/* ---------- signed daemon updates ----------
+ * The daemon in the system image is only a floor. The Iris app (updatable
+ * on its own) can push a newer irisd over the control socket (INSTALL); it
+ * is stored under g_bin_dir and exec'd by the older image copy at startup
+ * (maybe_exec_override). Trust does not rest on who may reach the socket:
+ * the binary must carry an Ed25519 signature from the release key compiled
+ * in as IRISD_UPDATE_PUBKEY_HEX. Without that define, updates are disabled. */
+
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int hex_decode(const char *hex, unsigned char *out, size_t out_len) {
+    if (strlen(hex) != out_len * 2) return -1;
+    for (size_t i = 0; i < out_len; i++) {
+        int hi = hexval(hex[2 * i]), lo = hexval(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i] = (unsigned char)(hi * 16 + lo);
+    }
+    return 0;
+}
+
+static int valid_version(const char *v) {
+    size_t n = strlen(v);
+    if (n == 0 || n > 31) return 0;
+    for (size_t i = 0; i < n; i++) if (!isdigit((unsigned char)v[i]) && v[i] != '.') return 0;
+    return 1;
+}
+
+/* a > b for dotted numeric versions (up to 4 components) */
+static int version_newer(const char *a, const char *b) {
+    int ai[4] = {0, 0, 0, 0}, bi[4] = {0, 0, 0, 0};
+    sscanf(a, "%d.%d.%d.%d", &ai[0], &ai[1], &ai[2], &ai[3]);
+    sscanf(b, "%d.%d.%d.%d", &bi[0], &bi[1], &bi[2], &bi[3]);
+    for (int i = 0; i < 4; i++) {
+        if (ai[i] != bi[i]) return ai[i] > bi[i];
+    }
+    return 0;
+}
+
+/* Signed message = "irisd <version>\n" || binary, so a signature can't be
+ * replayed under a different (e.g. newer) version number. */
+static int verify_update(const char *version, const unsigned char *data, size_t len,
+                         const unsigned char *sig /* 64 bytes */) {
+#ifdef IRISD_UPDATE_PUBKEY_HEX
+    unsigned char pub[32];
+    if (hex_decode(IRISD_UPDATE_PUBKEY_HEX, pub, sizeof(pub)) != 0) return -1;
+
+    char prefix[64];
+    int plen = snprintf(prefix, sizeof(prefix), "irisd %s\n", version);
+    unsigned char *msg = malloc((size_t)plen + len);
+    if (!msg) return -1;
+    memcpy(msg, prefix, (size_t)plen);
+    memcpy(msg + plen, data, len);
+
+    int ok = -1;
+    EVP_PKEY *pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, pub, sizeof(pub));
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (pkey && ctx && EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
+        EVP_DigestVerify(ctx, sig, 64, msg, (size_t)plen + len) == 1) {
+        ok = 0;
+    }
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    free(msg);
+    return ok;
+#else
+    (void)version; (void)data; (void)len; (void)sig;
+    return -1;
+#endif
+}
+
+static unsigned char *read_file_all(const char *path, size_t max, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    unsigned char *buf = malloc(max + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t n = fread(buf, 1, max + 1, f);
+    fclose(f);
+    if (n > max) { free(buf); return NULL; }
+    *out_len = n;
+    return buf;
+}
+
+/* Writes via <path>.new then rename(), so readers never see a partial file. */
+static int write_file_atomic(const char *path, const void *data, size_t len, mode_t mode) {
+    char tmp[600];
+    snprintf(tmp, sizeof(tmp), "%s.new", path);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    const unsigned char *p = data;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, p + off, len - off);
+        if (w <= 0) { close(fd); unlink(tmp); return -1; }
+        off += (size_t)w;
+    }
+    fchmod(fd, mode);
+    fsync(fd);
+    close(fd);
+    if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    return 0;
+}
+
+/* Called first thing in main() by the image copy. Execs the stored update
+ * if it is newer than this build and still verifies. A crash-loop guard
+ * drops a bad update after BOOT_FAIL_LIMIT unstable starts, so a broken
+ * release can't strand push delivery until the next OS update. */
+static void maybe_exec_override(char **argv) {
+    if (getenv("IRISD_OVERRIDE")) return;
+
+    char bin[560], sigp[560], verp[560], cnt[560];
+    snprintf(bin, sizeof(bin), "%s/irisd", g_bin_dir);
+    snprintf(sigp, sizeof(sigp), "%s/irisd.sig", g_bin_dir);
+    snprintf(verp, sizeof(verp), "%s/irisd.ver", g_bin_dir);
+    snprintf(cnt, sizeof(cnt), "%s/boot_count", g_bin_dir);
+
+    struct stat st;
+    if (stat(bin, &st) != 0 || !S_ISREG(st.st_mode)) return;
+
+    int fails = 0;
+    FILE *f = fopen(cnt, "r");
+    if (f) { if (fscanf(f, "%d", &fails) != 1) fails = 0; fclose(f); }
+    if (fails >= BOOT_FAIL_LIMIT) {
+        LOGW("update failed to stay up %d times, discarding it", fails);
+        unlink(bin); unlink(sigp); unlink(verp); unlink(cnt);
+        return;
+    }
+
+    char ver[40] = "";
+    f = fopen(verp, "r");
+    if (!f) return;
+    if (fgets(ver, sizeof(ver), f)) ver[strcspn(ver, "\r\n")] = '\0';
+    fclose(f);
+    if (!valid_version(ver) || !version_newer(ver, IRISD_VERSION)) return;
+
+    size_t len = 0, siglen = 0;
+    unsigned char *data = read_file_all(bin, MAX_UPDATE_BYTES, &len);
+    unsigned char *sig = read_file_all(sigp, 64, &siglen);
+    int ok = data && sig && siglen == 64 && verify_update(ver, data, len, sig) == 0;
+    free(data);
+    free(sig);
+    if (!ok) { LOGW("stored update failed signature check, ignoring it"); return; }
+
+    char count[16];
+    int cn = snprintf(count, sizeof(count), "%d\n", fails + 1);
+    write_file_atomic(cnt, count, (size_t)cn, 0640);
+
+    LOGI("exec'ing signed update %s (this image build is %s)", ver, IRISD_VERSION);
+    setenv("IRISD_OVERRIDE", "1", 1);
+    execv(bin, argv);
+    LOGE("exec of update failed: %s", strerror(errno));
+    unsetenv("IRISD_OVERRIDE");
+}
+
+/* In the exec'd update: once it has stayed up long enough, clear the
+ * crash-loop counter. */
+static void *stable_thread_main(void *arg) {
+    (void)arg;
+    sleep(STABLE_AFTER_SEC);
+    char cnt[560];
+    snprintf(cnt, sizeof(cnt), "%s/boot_count", g_bin_dir);
+    unlink(cnt);
+    return NULL;
+}
+
+/* ---------- control commands (app -> daemon) ---------- */
+
+static int valid_pkg(const char *s) {
+    size_t n = strlen(s);
+    if (n == 0 || n > 198) return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!isalnum((unsigned char)s[i]) && s[i] != '.' && s[i] != '_') return 0;
+    }
+    return s[0] != '.';
+}
+
+static int valid_token(const char *s) {
+    size_t n = strlen(s);
+    if (n == 0 || n > 254) return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!isalnum((unsigned char)s[i]) && s[i] != '-' && s[i] != '_') return 0;
+    }
+    return 1;
+}
+
+static int valid_url(const char *s) {
+    size_t n = strlen(s);
+    if (n < 9 || n > 254) return 0;
+    if (strncmp(s, "https://", 8) != 0 && strncmp(s, "http://", 7) != 0) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c <= 0x20 || c >= 0x7f) return 0;
+    }
+    return 1;
+}
+
+static void send_ack(int fd, const char *cmd, const char *err) {
+    char line[256];
+    if (err) snprintf(line, sizeof(line), "{\"type\":\"ack\",\"cmd\":\"%s\",\"ok\":false,\"error\":\"%s\"}", cmd, err);
+    else snprintf(line, sizeof(line), "{\"type\":\"ack\",\"cmd\":\"%s\",\"ok\":true}", cmd);
+    bridge_send_to(fd, line);
+}
+
+static const char *cmd_register(const char *pkg, const char *url, const char *token) {
+    if (!valid_pkg(pkg)) return "bad_package";
+    if (!valid_url(url)) return "bad_url";
+    if (!valid_token(token)) return "bad_token";
+
+    char path[700], body[800];
+    snprintf(path, sizeof(path), "%s/%s.conf", g_config_dir, pkg);
+    int n = snprintf(body, sizeof(body), "server_url=%s\ntoken=%s\npackage_name=%s\n", url, token, pkg);
+    if (write_file_atomic(path, body, (size_t)n, 0600) != 0) {
+        LOGE("could not write %s: %s", path, strerror(errno));
+        return "write_failed";
+    }
+    rescan_dir(g_config_dir); /* don't depend on inotify timing for the ack */
+    return NULL;
+}
+
+static const char *cmd_install(int fd, const char *args) {
+    unsigned long size = 0;
+    char version[40] = "", sighex[200] = "";
+    if (sscanf(args, "%lu %39s %199s", &size, version, sighex) != 3) return "bad_args";
+    if (size == 0 || size > MAX_UPDATE_BYTES) return "bad_size";
+    if (!valid_version(version)) return "bad_version";
+
+    /* The payload follows the command line whether or not we accept it;
+     * drain it either way so the stream stays in sync. */
+    unsigned char *data = malloc(size);
+    if (!data) return "oom";
+    size_t got = 0;
+    while (got < size) {
+        ssize_t r = read(fd, data + got, size - got);
+        if (r <= 0) { free(data); return "short_payload"; }
+        got += (size_t)r;
+    }
+
+    unsigned char sig[64];
+    const char *err = NULL;
+    char bin[560], sigp[560], verp[560];
+    snprintf(bin, sizeof(bin), "%s/irisd", g_bin_dir);
+    snprintf(sigp, sizeof(sigp), "%s/irisd.sig", g_bin_dir);
+    snprintf(verp, sizeof(verp), "%s/irisd.ver", g_bin_dir);
+
+#ifndef IRISD_UPDATE_PUBKEY_HEX
+    err = "updates_disabled";
+#else
+    if (hex_decode(sighex, sig, sizeof(sig)) != 0) err = "bad_signature_format";
+    else if (verify_update(version, data, size, sig) != 0) err = "signature_invalid";
+    else if (!version_newer(version, IRISD_VERSION)) err = "not_newer";
+    else {
+        /* sig and version first, binary last: a crash in between leaves a
+         * set that fails verification and is simply ignored at startup. */
+        char vline[48];
+        int vn = snprintf(vline, sizeof(vline), "%s\n", version);
+        mkdir(g_bin_dir, 0750);
+        if (write_file_atomic(sigp, sig, sizeof(sig), 0640) != 0 ||
+            write_file_atomic(verp, vline, (size_t)vn, 0640) != 0 ||
+            write_file_atomic(bin, data, size, 0750) != 0) {
+            err = "write_failed";
+        }
+    }
+#endif
+    (void)sig; (void)sighex; (void)bin; (void)sigp; (void)verp;
+    free(data);
+    if (!err) LOGI("installed signed update %s (%lu bytes), takes effect on RELOAD", version, size);
+    else LOGW("update %s rejected: %s", version, err);
+    return err;
+}
+
+static void handle_command(int fd, char *line) {
+    char cmd[16] = "";
+    char *args = strchr(line, ' ');
+    size_t cl = args ? (size_t)(args - line) : strlen(line);
+    if (cl == 0 || cl >= sizeof(cmd)) return; /* unknown -> ignored (forward compat) */
+    memcpy(cmd, line, cl);
+    args = args ? args + 1 : line + strlen(line);
+
+    if (strcmp(cmd, "STATUS") == 0) {
+        char status[4096];
+        build_status_json(status, sizeof(status));
+        bridge_send_to(fd, status);
+    } else if (strcmp(cmd, "UNSUBSCRIBE") == 0) {
+        /* one-shot command clients don't want the push fan-out */
+        bridge_remove_client(fd);
+        send_ack(fd, cmd, NULL);
+    } else if (strcmp(cmd, "REGISTER") == 0) {
+        char pkg[200] = "", url[256] = "", tok[256] = "";
+        if (sscanf(args, "%199s %255s %255s", pkg, url, tok) != 3) {
+            send_ack(fd, cmd, "bad_args");
+        } else {
+            send_ack(fd, cmd, cmd_register(pkg, url, tok));
+        }
+    } else if (strcmp(cmd, "UNREGISTER") == 0) {
+        char pkg[200] = "";
+        if (sscanf(args, "%199s", pkg) != 1 || !valid_pkg(pkg)) {
+            send_ack(fd, cmd, "bad_package");
+        } else {
+            char path[700];
+            snprintf(path, sizeof(path), "%s/%s.conf", g_config_dir, pkg);
+            unlink(path);
+            rescan_dir(g_config_dir);
+            send_ack(fd, cmd, NULL);
+        }
+    } else if (strcmp(cmd, "INSTALL") == 0) {
+        send_ack(fd, cmd, cmd_install(fd, args));
+    } else if (strcmp(cmd, "RELOAD") == 0) {
+        /* init restarts us; the image copy then picks up any stored update */
+        send_ack(fd, cmd, NULL);
+        LOGI("RELOAD requested, exiting for init to restart");
+        _exit(0);
+    }
+}
+
 /* ---------- bridge client reader thread (IrisBridgeService -> daemon commands) ----------
  * Each accepted bridge client also gets a reader thread so it can issue
  * "STATUS\n" and get back one JSON line describing daemon_version plus
@@ -842,26 +1234,27 @@ static void *bridge_client_reader_main(void *arg) {
     int fd = ((bridge_reader_arg_t *)arg)->fd;
     free(arg);
 
-    char line[256];
+    char line[1024];
     size_t len = 0;
+    int overflow = 0;
     for (;;) {
         char c;
         ssize_t r = read(fd, &c, 1);
         if (r <= 0) break;
         if (c == '\n') {
             line[len] = '\0';
-            if (strcmp(line, "STATUS") == 0) {
-                char status[4096];
-                build_status_json(status, sizeof(status));
-                bridge_send_to(fd, status);
-            }
+            if (!overflow) handle_command(fd, line);
             len = 0;
+            overflow = 0;
         } else if (len + 1 < sizeof(line)) {
             line[len++] = c;
+        } else {
+            overflow = 1; /* drop the over-long line instead of acting on a truncated one */
         }
     }
 
     bridge_remove_client(fd);
+    close(fd);
     LOGI("bridge client disconnected (fd=%d)", fd);
     return NULL;
 }
@@ -906,10 +1299,22 @@ static int create_bridge_listen_socket(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+        printf("%s\n", IRISD_VERSION);
+        return 0;
+    }
     signal(SIGPIPE, SIG_IGN);
 
     const char *config_dir = getenv("IRIS_CONFIG_DIR");
     if (!config_dir) config_dir = (argc > 1) ? argv[1] : "/data/misc/iris/tokens";
+    g_config_dir = config_dir;
+    if (getenv("IRIS_BIN_DIR")) g_bin_dir = getenv("IRIS_BIN_DIR");
+
+    maybe_exec_override(argv);
+    if (getenv("IRISD_OVERRIDE")) {
+        pthread_t stable_tid;
+        if (pthread_create(&stable_tid, NULL, stable_thread_main, NULL) == 0) pthread_detach(stable_tid);
+    }
 
     SSL_library_init();
     SSL_load_error_strings();

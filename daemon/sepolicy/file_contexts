@@ -3,4 +3,5 @@
 
 /system/bin/irisd            u:object_r:iris_daemon_exec:s0
 /data/misc/iris(/.*)?        u:object_r:iris_data_file:s0
+/data/misc/iris/bin(/.*)?    u:object_r:iris_update_file:s0
 /dev/socket/iris_daemon      u:object_r:iris_daemon_socket:s0

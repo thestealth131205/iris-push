@@ -39,6 +39,17 @@ hardened daemon - see "Known simplifications" below before relying on it.
   same socket name, and to show per-app connection status without having
   to hold its own duplicate connection.
 
+## Control commands and daemon updates (v1.2.0)
+
+Besides `STATUS`, the control socket now takes `REGISTER`, `UNREGISTER`,
+`INSTALL` and `RELOAD`: the Iris app pushes tokens into the daemon (so no app
+needs write access to `/data/misc/iris`) and can ship a newer, Ed25519-signed
+`irisd` without an OS update. Full spec, update flow and the registration
+broadcast for other apps: [`CONTROL_PROTOCOL.md`](CONTROL_PROTOCOL.md). The
+section below still describes the push-line and `STATUS` basics.
+Tested standalone against a Linux box (register, bad input, signed/unsigned
+INSTALL, RELOAD into the new version, crash-loop fallback); not yet on a device.
+
 ## Bridge control-socket protocol
 
 Any client connected to `iris_daemon` receives, unprompted, one JSON line
