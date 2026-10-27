@@ -12,8 +12,8 @@ android {
         applicationId = "de.letheapp.iris"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "1.3.2"
+        versionCode = 8
+        versionName = "1.3.3"
     }
 
     signingConfigs {

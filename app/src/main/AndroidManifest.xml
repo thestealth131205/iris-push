@@ -4,7 +4,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
@@ -53,15 +53,27 @@
             </intent-filter>
         </activity>
 
+        <!-- specialUse statt dataSync: dataSync ist ab Android 15 auf 6h/24h begrenzt,
+             eine dauerhafte Push-Verbindung braucht einen FGS-Typ ohne Zeitlimit. -->
         <service
             android:name=".IrisPushService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Persistent push notification connection (FCM replacement)" />
+        </service>
 
+        <!-- specialUse statt dataSync: dataSync ist ab Android 15 auf 6h/24h begrenzt,
+             eine dauerhafte Push-Verbindung braucht einen FGS-Typ ohne Zeitlimit. -->
         <service
             android:name=".IrisBridgeService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Persistent push notification connection (FCM replacement)" />
+        </service>
 
         <receiver
             android:name=".RegistrationReceiver"

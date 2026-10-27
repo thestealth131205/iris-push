@@ -6,9 +6,11 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.CompletableDeferred
@@ -85,10 +87,13 @@ class IrisPushService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         try {
-            startForeground(NOTIFICATION_ID, buildNotification("Verbinde…"))
+            ServiceCompat.startForeground(
+                this, NOTIFICATION_ID, buildNotification("Verbinde…"),
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
+            )
         } catch (e: Exception) {
-            // dataSync FGS time quota (Android 15+) already exhausted for today -
-            // retry later instead of crashing (see ForegroundServiceRestart).
+            // Safety net (e.g. background-start restrictions, or a stale dataSync
+            // quota from <=1.3.1) - retry later instead of crashing.
             IrisLog.log(this, "IrisPushService", "onStartCommand: startForeground abgelehnt (${e.javaClass.simpleName}), Neustart in 30min")
             ForegroundServiceRestart.scheduleRetry(this)
             stopSelf()
@@ -126,8 +131,9 @@ class IrisPushService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     /**
-     * Android 15+ gives a dataSync FGS a chance to clean up before being
-     * force-stopped once its 6h/24h quota runs out. Without this override
+     * Safety net only: the service is specialUse-typed now (no time limit),
+     * but Android 15+ calls this for time-limited FGS types (dataSync, as
+     * used up to 1.3.1) before force-stopping them. Without this override
      * the system kills the process and reports
      * ForegroundServiceDidNotStopInTimeException as a crash.
      */
