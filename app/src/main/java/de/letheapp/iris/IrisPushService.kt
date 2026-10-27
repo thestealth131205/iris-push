@@ -84,7 +84,16 @@ class IrisPushService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, buildNotification("Verbinde…"))
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification("Verbinde…"))
+        } catch (e: Exception) {
+            // dataSync FGS time quota (Android 15+) already exhausted for today -
+            // retry later instead of crashing (see ForegroundServiceRestart).
+            IrisLog.log(this, "IrisPushService", "onStartCommand: startForeground abgelehnt (${e.javaClass.simpleName}), Neustart in 30min")
+            ForegroundServiceRestart.scheduleRetry(this)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         if (!IrisConfig.isConfigured(this)) {
             IrisLog.log(this, "IrisPushService", "onStartCommand: keine Registrierung, stoppe")
             stopSelf()
@@ -115,6 +124,18 @@ class IrisPushService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * Android 15+ gives a dataSync FGS a chance to clean up before being
+     * force-stopped once its 6h/24h quota runs out. Without this override
+     * the system kills the process and reports
+     * ForegroundServiceDidNotStopInTimeException as a crash.
+     */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        IrisLog.log(this, "IrisPushService", "onTimeout: FGS-Zeitlimit erreicht (type=$fgsType), Neustart in 30min")
+        ForegroundServiceRestart.scheduleRetry(this)
+        stopSelf()
+    }
 
     /** Starts a connectLoop for every newly-registered app, cancels one for every removed app. */
     private fun syncConnections() {

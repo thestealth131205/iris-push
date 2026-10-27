@@ -70,7 +70,16 @@ class IrisBridgeService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, buildNotification("Verbinde mit Systemdienst…"))
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification("Verbinde mit Systemdienst…"))
+        } catch (e: Exception) {
+            // dataSync FGS time quota (Android 15+) already exhausted for today -
+            // retry later instead of crashing (see ForegroundServiceRestart).
+            IrisLog.log(this, "IrisBridgeService", "onStartCommand: startForeground abgelehnt (${e.javaClass.simpleName}), Neustart in 30min")
+            ForegroundServiceRestart.scheduleRetry(this)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         if (connectLoopJob?.isActive != true) {
             connectLoopJob = scope.launch { connectLoop() }
         }
@@ -85,6 +94,18 @@ class IrisBridgeService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * Android 15+ gives a dataSync FGS a chance to clean up before being
+     * force-stopped once its 6h/24h quota runs out. Without this override
+     * the system kills the process and reports
+     * ForegroundServiceDidNotStopInTimeException as a crash.
+     */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        IrisLog.log(this, "IrisBridgeService", "onTimeout: FGS-Zeitlimit erreicht (type=$fgsType), Neustart in 30min")
+        ForegroundServiceRestart.scheduleRetry(this)
+        stopSelf()
+    }
 
     private suspend fun connectLoop() {
         while (scope.isActive) {
