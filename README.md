@@ -73,8 +73,8 @@ to end, in two forms now:
   are present.
 
 Known gaps are listed in `PROTOCOL.md` under "Known limitations" — most
-notably: no cross-instance routing on the server side, and no offline
-queueing. PRs welcome.
+notably: a custom server behind a load balancer needs its own
+cross-instance routing layer. PRs welcome.
 
 ## Using it
 

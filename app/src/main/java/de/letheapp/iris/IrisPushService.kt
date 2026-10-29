@@ -7,8 +7,13 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.google.gson.Gson
@@ -28,6 +33,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
@@ -36,8 +42,11 @@ import java.util.concurrent.TimeUnit
  * the corresponding target app via a signature-protected broadcast. See
  * PROTOCOL.md for the wire format.
  *
- * Each connection reconnects independently with a fixed backoff and sends a
- * "ping" text frame every 45s. [onStartCommand] is safe to call repeatedly
+ * Each connection reconnects independently with a backoff and sends a
+ * "ping" text frame every 45s (plus an [IrisHeartbeat] alarm while the device
+ * sleeps). A ping without "pong" within [PONG_TIMEOUT_MS] - or a network change -
+ * drops the socket and reconnects: a half-open TCP connection (e.g. after the
+ * router got a new IP prefix overnight) otherwise looks healthy forever. [onStartCommand] is safe to call repeatedly
  * (e.g. after a registration was added/removed) - it reconciles the set of
  * running connections against the current registration list instead of
  * assuming it's only ever started once.
@@ -49,6 +58,12 @@ class IrisPushService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val PING_INTERVAL_MS = 45_000L
         private const val RECONNECT_DELAY_MS = 5_000L
+        private const val MAX_RECONNECT_DELAY_MS = 5 * 60_000L
+        private const val PONG_TIMEOUT_MS = 15_000L
+        // Wakelock per reconnect attempt / heartbeat - only for the first few failures,
+        // so a phone without network isn't kept awake by an endless retry loop.
+        private const val RECONNECT_WAKELOCK_MS = 20_000L
+        private const val MAX_WAKEFUL_RETRIES = 3
         private const val CLOSE_TOKEN_REJECTED = 4001
         // Server: another connection with the same token took over (e.g. the app's own
         // fallback connection while it hands over to Iris). Wait longer before retrying
@@ -71,6 +86,13 @@ class IrisPushService : Service() {
          * if the service isn't running.
          */
         fun isRunning(): Boolean = running != null
+
+        /** Called by [HeartbeatReceiver]: pings every socket. False if the service isn't running. */
+        fun heartbeat(): Boolean {
+            val service = running ?: return false
+            service.onHeartbeat()
+            return true
+        }
 
         fun resyncIfRunning(): Boolean {
             val service = running ?: return false
@@ -98,6 +120,37 @@ class IrisPushService : Service() {
     }
     private val gson = Gson()
 
+    /** One open socket; [awaitingPongSince] = elapsedRealtime of the unanswered ping, 0 if none. */
+    private class Conn(val packageName: String, val socket: WebSocket) {
+        @Volatile var awaitingPongSince = 0L
+    }
+    private val conns = ConcurrentHashMap<String, Conn>() // package_name -> open socket
+    private val wakeLock: PowerManager.WakeLock? by lazy {
+        getSystemService(PowerManager::class.java)
+            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "iris:heartbeat")
+            ?.apply { setReferenceCounted(false) }
+    }
+    private var lastNetwork: Network? = null
+    private var lastAddresses: Set<String>? = null
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            val previous = lastNetwork
+            lastNetwork = network
+            if (previous != null && previous != network) reconnectAll("Netzwerk gewechselt")
+        }
+
+        override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+            val addresses = linkProperties.linkAddresses.map { it.address.hostAddress.orEmpty() }.toSet()
+            val previous = lastAddresses
+            lastAddresses = addresses
+            // New IP (router reconnect, IPv6 prefix change): sockets bound to the old
+            // address are dead, but nothing tells OkHttp so.
+            if (previous != null && network == lastNetwork && previous != addresses) {
+                reconnectAll("IP-Adresse geändert")
+            }
+        }
+    }
+
     private val client = OkHttpClient.Builder()
         .pingInterval(0, TimeUnit.SECONDS) // we send our own text "ping", see PING_INTERVAL_MS
         .readTimeout(0, TimeUnit.SECONDS)
@@ -108,6 +161,12 @@ class IrisPushService : Service() {
         createNotificationChannel()
         running = this
         IrisLog.log(this, "IrisPushService", "onCreate")
+        try {
+            getSystemService(ConnectivityManager::class.java)?.registerDefaultNetworkCallback(networkCallback)
+        } catch (e: Exception) {
+            IrisLog.log(this, "IrisPushService", "NetworkCallback nicht registrierbar: ${e.javaClass.simpleName}")
+        }
+        IrisHeartbeat.schedule(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -153,6 +212,13 @@ class IrisPushService : Service() {
         jobTokens.clear()
         mainHandler.removeCallbacks(postNotification)
         serviceJob.cancel()
+        try {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(networkCallback)
+        } catch (_: Exception) {
+        }
+        IrisHeartbeat.cancel(this)
+        conns.clear()
+        releaseWakeLock()
         // Sockets aren't tied to the coroutines - close them explicitly, otherwise a
         // restarted service connects a second time with the same token and the two
         // connections keep replacing each other at the server.
@@ -204,37 +270,94 @@ class IrisPushService : Service() {
     }
 
     private suspend fun connectLoop(reg: IrisRegistration) {
+        var failures = 0
         while (scope.isActive) {
             var closeCode = 0
+            var opened = false
             try {
-                closeCode = connectOnce(reg)
+                closeCode = connectOnce(reg) { opened = true }
             } catch (e: Exception) {
                 IrisLog.log(this, "IrisPushService", "Verbindung zu ${reg.packageName} fehlgeschlagen: ${e.javaClass.simpleName}: ${e.message}")
             }
             setStatus(reg.packageName, false)
             updateNotification(summaryText())
-            delay(if (closeCode == CLOSE_REPLACED) REPLACED_RETRY_DELAY_MS else RECONNECT_DELAY_MS)
+            failures = if (opened) 1 else failures + 1
+            // Keep the CPU awake for the retry - otherwise a socket that died while the
+            // phone sleeps is only replaced at the next wake-up, minutes or hours later.
+            if (failures <= MAX_WAKEFUL_RETRIES) wakeLock?.acquire(RECONNECT_WAKELOCK_MS)
+            val backoff = (RECONNECT_DELAY_MS shl (failures - 1).coerceIn(0, 6)).coerceAtMost(MAX_RECONNECT_DELAY_MS)
+            delay(if (closeCode == CLOSE_REPLACED) REPLACED_RETRY_DELAY_MS else backoff)
+        }
+    }
+
+    /** Drops every socket so connectLoop reconnects right away (network/IP changed). */
+    private fun reconnectAll(reason: String) {
+        if (conns.isEmpty()) return
+        IrisLog.log(this, "IrisPushService", "$reason – verbinde ${conns.size} Socket(s) neu")
+        wakeLock?.acquire(RECONNECT_WAKELOCK_MS)
+        for (conn in conns.values) conn.socket.cancel()
+    }
+
+    private fun onHeartbeat() {
+        IrisHeartbeat.schedule(this)
+        if (conns.isEmpty()) return
+        wakeLock?.acquire(PONG_TIMEOUT_MS + 5_000L)
+        for (conn in conns.values) sendPing(conn)
+    }
+
+    /** Sends "ping" and drops the socket if nothing comes back within [PONG_TIMEOUT_MS]. */
+    private fun sendPing(conn: Conn) {
+        if (conn.awaitingPongSince == 0L) conn.awaitingPongSince = SystemClock.elapsedRealtime()
+        if (!conn.socket.send("ping")) return
+        scope.launch {
+            delay(PONG_TIMEOUT_MS)
+            val since = conn.awaitingPongSince
+            if (since != 0L && SystemClock.elapsedRealtime() - since >= PONG_TIMEOUT_MS && conns[conn.packageName] === conn) {
+                IrisLog.log(this@IrisPushService, "IrisPushService", "${conn.packageName}: kein pong seit ${PONG_TIMEOUT_MS / 1000}s – Verbindung tot, verbinde neu")
+                conn.socket.cancel()
+            }
+            releaseWakeLockIfIdle()
+        }
+    }
+
+    private fun releaseWakeLockIfIdle() {
+        if (conns.values.none { it.awaitingPongSince != 0L }) releaseWakeLock()
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.takeIf { it.isHeld }?.release()
+        } catch (_: Exception) {
         }
     }
 
     /** Suspends until the socket closes or fails, then returns the close code (0 on failure) so connectLoop can retry. */
-    private suspend fun connectOnce(reg: IrisRegistration): Int {
-        val url = IrisConfig.websocketUrl(this, reg.token)
+    private suspend fun connectOnce(reg: IrisRegistration, onOpened: () -> Unit): Int {
+        // ack=1: we confirm every push, the server re-sends unconfirmed ones after a reconnect.
+        val url = IrisConfig.websocketUrl(this, reg.token) + "?ack=1"
         val request = Request.Builder().url(url).build()
         val closed = CompletableDeferred<Int>()
         var activeSocket: WebSocket? = null
 
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                onOpened()
+                val conn = Conn(reg.packageName, webSocket)
+                conns[reg.packageName] = conn
                 setStatus(reg.packageName, true)
                 updateNotification(summaryText())
-                scope.launch { pingLoop(webSocket) { activeSocket === webSocket } }
+                releaseWakeLockIfIdle()
+                scope.launch { pingLoop(conn) { activeSocket === webSocket } }
                 scope.launch { IrisApi.reportInstalled(IrisConfig.getServerUrl(this@IrisPushService), reg.token) }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                conns[reg.packageName]?.takeIf { it.socket === webSocket }?.let {
+                    it.awaitingPongSince = 0L // any frame proves the connection is alive
+                    releaseWakeLockIfIdle()
+                }
                 if (text == "pong") return
-                handleIncoming(reg, text)
+                handleIncoming(reg, webSocket, text)
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -243,6 +366,7 @@ class IrisPushService : Service() {
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 IrisLog.log(this@IrisPushService, "IrisPushService", "${reg.packageName}: Verbindung geschlossen ($code $reason)")
+                conns[reg.packageName]?.let { if (it.socket === webSocket) conns.remove(reg.packageName, it) }
                 if (code == CLOSE_TOKEN_REJECTED) onTokenRejected(reg)
                 closed.complete(code)
             }
@@ -250,6 +374,7 @@ class IrisPushService : Service() {
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 IrisLog.log(this@IrisPushService, "IrisPushService", "${reg.packageName}: Verbindung fehlgeschlagen: ${t.javaClass.simpleName}: ${t.message}")
                 // Older servers reject unknown tokens before the handshake (HTTP 403).
+                conns[reg.packageName]?.let { if (it.socket === webSocket) conns.remove(reg.packageName, it) }
                 if (response?.code == 403) onTokenRejected(reg)
                 closed.complete(0)
             }
@@ -264,16 +389,15 @@ class IrisPushService : Service() {
         }
     }
 
-    private suspend fun pingLoop(webSocket: WebSocket, stillActive: () -> Boolean) {
+    private suspend fun pingLoop(conn: Conn, stillActive: () -> Boolean) {
         while (scope.isActive && stillActive()) {
             delay(PING_INTERVAL_MS)
             if (!stillActive()) break
-            val sent = webSocket.send("ping")
-            if (!sent) break
+            sendPing(conn)
         }
     }
 
-    private fun handleIncoming(reg: IrisRegistration, text: String) {
+    private fun handleIncoming(reg: IrisRegistration, webSocket: WebSocket, text: String) {
         val type = object : TypeToken<Map<String, Any?>>() {}.type
         val payload: Map<String, Any?> = try {
             gson.fromJson(text, type)
@@ -287,7 +411,11 @@ class IrisPushService : Service() {
         val data = payload["data"]
         val dataJson = if (data != null) gson.toJson(data) else "{}"
 
-        PushDelivery.deliver(this, reg.packageName, reg.token, title, body, dataJson)
+        val pushId = payload["push_id"] as? String
+        if (pushId == null || PushDedup.markNew(this, pushId)) {
+            PushDelivery.deliver(this, reg.packageName, reg.token, title, body, dataJson)
+        }
+        if (pushId != null) webSocket.send("ack:$pushId")
     }
 
     /**

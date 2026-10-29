@@ -242,9 +242,9 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private fun isBatteryExempt(context: Context): Boolean {
+private fun isBatteryExempt(context: Context, packageName: String = context.packageName): Boolean {
     val pm = context.getSystemService(PowerManager::class.java)
-    return pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+    return pm?.isIgnoringBatteryOptimizations(packageName) == true
 }
 
 private fun isPackageInstalled(context: Context, packageName: String): Boolean = try {
@@ -265,15 +265,35 @@ private fun StatusIcon(ok: Boolean) {
 
 @Composable
 private fun AppStatusRow(packageName: String, connected: Boolean, onRemove: () -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        StatusIcon(connected)
-        Text(packageName, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
-        IconButton(onClick = onRemove) {
-            Icon(Icons.Default.Delete, contentDescription = "Entfernen")
+    val context = LocalContext.current
+    Column {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            StatusIcon(connected)
+            Text(packageName, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+            IconButton(onClick = onRemove) {
+                Icon(Icons.Default.Delete, contentDescription = "Entfernen")
+            }
+        }
+        // Iris weckt die App per Broadcast (kommt auch im Doze an). Ist die Ziel-App aber
+        // nicht von der Akku-Optimierung ausgenommen, läuft sie danach ohne Netz und darf
+        // keinen Foreground-Service starten (z.B. eingehender Anruf). Eine Ausnahme für eine
+        // fremde App kann nur der Nutzer in den Systemeinstellungen erteilen.
+        if (!isBatteryExempt(context, packageName)) {
+            Text(
+                "Im Tiefschlaf eingeschränkt: Diese App ist nicht von der Akku-Optimierung " +
+                    "ausgenommen. Sie wird geweckt, hat dann aber evtl. kein Netz.",
+                style = MaterialTheme.typography.bodySmall,
+                color = disconnectedColor
+            )
+            TextButton(onClick = {
+                try {
+                    context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                } catch (_: Exception) { }
+            }) { Text("Akku-Einstellungen öffnen") }
         }
     }
 }

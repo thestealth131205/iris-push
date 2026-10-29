@@ -101,6 +101,17 @@ never have to grant anything manually:
   `adb shell am get-standby-bucket de.letheapp.iris` → should report
   `EXEMPTED`.
 
+**Also allowlist the apps Iris wakes** (e.g. `<allow-in-power-save
+package="com.Lethe.app"/>`). Iris wakes them with an explicit broadcast, which
+Android delivers even in Doze — but a target app that is *not* on the Doze
+allowlist then runs without network access and may not start a foreground
+service (incoming call) from the background. FCM avoids this because GMS puts
+the target on a temporary allowlist for each high-priority message; without
+privileged code in Iris, the permanent sysconfig entry is the equivalent.
+On stock devices the target app asks the user for this exemption itself
+(`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) — it costs no battery on its
+own, since the app no longer runs anything in the background.
+
 Where to put the sysconfig overlay depends on your build structure — either
 a new file under `device/<vendor>/<codename>/sysconfig/iris.xml` wired into
 `PRODUCT_COPY_FILES`, or wherever your OS already carries its own

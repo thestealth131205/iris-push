@@ -33,23 +33,32 @@ senders need to push to you (step 3).
 ## 2. Receive pushes (device → server, persistent)
 
 ```
-GET /iris/connect/{token}      (upgrade: websocket)
+GET /iris/connect/{token}[?ack=1]      (upgrade: websocket)
 ```
 
-- Server closes with code `4001` if the token is unknown or revoked.
+- Server closes with code `4001` if the token is unknown or revoked, and with
+  `4002` if a newer connection with the same token replaced this one.
 - Client should send the text frame `"ping"` roughly every 45s to keep the
   connection (and any reverse proxy in between) alive; server replies
-  `"pong"`.
+  `"pong"`. A client should treat a missing `"pong"` (Iris: 15s) as a dead
+  connection and reconnect — a half-open TCP connection (e.g. after the
+  router got a new IP) otherwise looks healthy indefinitely.
 - Incoming push, as a JSON text frame:
 
 ```json
-{"type": "push", "title": "...", "body": "...", "data": {"key": "value"}}
+{"type": "push", "push_id": "…", "title": "...", "body": "...", "data": {"key": "value"}}
 ```
 
-There is currently **no offline queue** — if no device is connected for a
-token when `/push/send` is called, the push is dropped (`delivered: false`).
-A server could add persistence/retry on top of this without changing the
-protocol.
+### Offline queue and acknowledgements
+
+Pushes that can't be written to a connected socket are queued per token
+(48h, max. 100; call-type pushes expire after 60s) and sent right after the
+next `/iris/connect`.
+
+With `?ack=1` the client confirms every push with the text frame
+`"ack:<push_id>"`. Unconfirmed pushes stay queued and are re-sent on the next
+connect, so the client must de-duplicate by `push_id`. Without `ack=1`
+(older clients) a push counts as delivered once it was written to the socket.
 
 ## 3. Send a push (any sender → server)
 
@@ -127,9 +136,7 @@ apps installed from F-Droid/Play.
   backend routes across instances via Redis pub/sub (`iris_instance` hash +
   `iris:instance:<id>` channels); a custom server behind a load balancer
   needs something equivalent.
-- **No offline queueing.** A push sent while the device is disconnected is
-  simply dropped; there's no store-and-forward.
-- **No delivery receipts.** The server only knows a frame was written to the
-  socket, not that the app handled it.
+- **Queue is best-effort.** Pushes are queued in Redis (48h, max. 100 per
+  token); older/overflowing entries are dropped.
 
 Contributions tightening any of the above are welcome.
