@@ -78,7 +78,11 @@ class MainActivity : ComponentActivity() {
 
         val notificationPermissionLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.RequestPermission()
-        ) { /* if denied, the foreground service still runs, just without a visible notification */ }
+        ) {
+            // if denied, the foreground service still runs, just without a visible notification.
+            // Lethe is only opened after the dialog, so it doesn't cover the permission prompt.
+            openLetheOnceAfterInstallOrUpdate(context)
+        }
 
         LaunchedEffect(Unit) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -86,6 +90,8 @@ class MainActivity : ComponentActivity() {
                 != PackageManager.PERMISSION_GRANTED
             ) {
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            } else {
+                openLetheOnceAfterInstallOrUpdate(context)
             }
             while (true) {
                 registrations = IrisConfig.getRegistrations(context)
@@ -164,6 +170,7 @@ class MainActivity : ComponentActivity() {
                             "Lethe einmal (eingeloggt) – er meldet sich dann automatisch hier an.",
                         style = MaterialTheme.typography.bodySmall
                     )
+                    OutlinedButton(onClick = { openLethe(context) }) { Text("Lethe öffnen") }
                 }
 
                 HorizontalDivider()
@@ -245,6 +252,33 @@ class MainActivity : ComponentActivity() {
 private fun isBatteryExempt(context: Context, packageName: String = context.packageName): Boolean {
     val pm = context.getSystemService(PowerManager::class.java)
     return pm?.isIgnoringBatteryOptimizations(packageName) == true
+}
+
+private const val PREFS_ONBOARDING = "iris_onboarding"
+private const val KEY_LETHE_OPENED_FOR_VERSION = "lethe_opened_for_version"
+
+/**
+ * Lethe meldet sich nur beim eigenen Start bei Iris an. Nach einer Neuinstallation hat Iris
+ * keine Registrierung mehr, nach einem Update läuft Lethe evtl. noch gegen den alten Iris-Prozess –
+ * deshalb wird Lethe beim ersten Öffnen jeder neuen Iris-Version einmal gestartet.
+ */
+private fun openLetheOnceAfterInstallOrUpdate(context: Context) {
+    val prefs = context.getSharedPreferences(PREFS_ONBOARDING, Context.MODE_PRIVATE)
+    val version = BuildConfig.VERSION_CODE
+    if (prefs.getInt(KEY_LETHE_OPENED_FOR_VERSION, -1) == version) return
+    if (!isPackageInstalled(context, LETHE_PACKAGE)) return
+    prefs.edit().putInt(KEY_LETHE_OPENED_FOR_VERSION, version).apply()
+    IrisLog.log(context, "MainActivity", "Öffne Lethe einmalig nach Installation/Update (Version $version)")
+    openLethe(context)
+}
+
+private fun openLethe(context: Context) {
+    val intent = context.packageManager.getLaunchIntentForPackage(LETHE_PACKAGE) ?: return
+    try {
+        context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    } catch (e: Exception) {
+        IrisLog.log(context, "MainActivity", "Lethe konnte nicht geöffnet werden: ${e.javaClass.simpleName}")
+    }
 }
 
 private fun isPackageInstalled(context: Context, packageName: String): Boolean = try {
