@@ -20,8 +20,10 @@ cc_binary {
         "-Wextra",
         "-DANDROID_BUILD",
         // Release public key for signed daemon updates (tools/sign-irisd.sh
-        // genkey prints it). Without it INSTALL is disabled:
-        // "-DIRISD_UPDATE_PUBKEY_HEX=\"<64 hex chars>\"",
+        // genkey prints it). Without it INSTALL is disabled. Executing the
+        // update from /data also needs the OS tree's sepolicy exemption, see
+        // sepolicy/iris_daemon.te.
+        "-DIRISD_UPDATE_PUBKEY_HEX=\"3036455268057b18b074854f922f78581ba982deee03cb4500e1706d2a74515d\"",
     ],
     shared_libs: [
         "libssl",

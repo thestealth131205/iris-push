@@ -5,8 +5,10 @@
 # REGISTER, a push round-trip, an INSTALL+RELOAD) rather than trusting this
 # file blindly. See OS_INTEGRATION_PLAN.md Tier 2, step 3.
 
-type iris_daemon, domain;
-type iris_daemon_exec, exec_type, file_type;
+# Lives in /system and is started by init, so on a Treble device it must be a
+# coredomain and its executable a system_file_type (domain.te neverallows).
+type iris_daemon, domain, coredomain;
+type iris_daemon_exec, system_file_type, exec_type, file_type;
 
 # Standard boilerplate for anything started by init via a `service` block.
 init_daemon_domain(iris_daemon)
@@ -19,28 +21,37 @@ allow iris_daemon self:udp_socket create_socket_perms; # DNS resolution
 # CA bundle for certificate validation.
 r_dir_file(iris_daemon, system_file)
 
+# /data/misc is system_data_file; irisd only has to traverse it.
+allow iris_daemon system_data_file:dir search;
+
 # Per-app config files (tokens/), written by irisd on REGISTER, read back
-# on start; the directory is watched via inotify.
-type iris_data_file, file_type, data_file_type;
+# on start; the directory is watched via inotify. core_data_file_type: only
+# core (system) domains may touch it, as Treble requires for /data outside
+# /data/vendor.
+type iris_data_file, file_type, data_file_type, core_data_file_type;
 allow iris_daemon iris_data_file:dir create_dir_perms;
 allow iris_daemon iris_data_file:file create_file_perms;
 
 # Signed daemon update (bin/): written by irisd on INSTALL, exec'd by the
 # image copy of irisd at start (no domain transition: same domain).
 #
-# VERIFY IN THE TREE: AOSP's domain.te carries neverallow rules against
-# executing files from data partitions. This tree is ours, so the fix is to
-# exempt iris_daemon / iris_update_file in those neverallow lines (and
-# keep the Ed25519 signature check in irisd.c as the real gate); do not
-# widen anything else. If that proves unacceptable, the fallback is a
-# dedicated /product/bin/irisd that only the OS image can replace.
-type iris_update_file, file_type, data_file_type;
+# AOSP's domain.te forbids every non-app domain to execute anything from
+# /data ("Protect most domains from executing arbitrary content from /data")
+# or any non-system, non-exec_type file. The OS tree therefore has to exempt
+# iris_daemon from those two neverallows - LetheOS does it with a private
+# platform attribute (lethe_data_exec_domain, assigned in vendor/lethe). The
+# Ed25519 signature check in irisd.c stays the real gate; nothing else is
+# widened. Without such an exemption, drop the execute permissions below and
+# build without IRISD_UPDATE_PUBKEY_HEX (updates then only ship via OTA).
+type iris_update_file, file_type, data_file_type, core_data_file_type;
 allow iris_daemon iris_update_file:dir create_dir_perms;
 allow iris_daemon iris_update_file:file { create_file_perms execute execute_no_trans map };
 
 # The control socket itself (init creates the sock file; irisd accepts on
-# the inherited fd).
-type iris_daemon_socket, file_type;
+# the inherited fd). coredomain_socket: a socket owned by a core domain;
+# mlstrustedobject so the platform-signed Iris app can connect across MLS
+# categories.
+type iris_daemon_socket, file_type, coredomain_socket, mlstrustedobject;
 allow iris_daemon iris_daemon_socket:sock_file { create setattr unlink write };
 allow iris_daemon self:unix_stream_socket { create_stream_socket_perms listen accept };
 
